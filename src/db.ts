@@ -10,10 +10,14 @@ import { NewMessage, ScheduledTask, TaskRunLog } from './types.js';
 let db: Database.Database;
 
 export function initDatabase(): void {
-  const dbPath = path.join(STORE_DIR, 'messages.db');
+  logger.info('Initializing database...');
+  const dbPath = path.join(process.cwd(), 'data', 'nanoclaw.db');
+  logger.info(`Database path: ${dbPath}`);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  logger.info('Database directory ensured.');
 
   db = new Database(dbPath);
+  logger.info('Database instance created.');
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -60,13 +64,25 @@ export function initDatabase(): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+    CREATE TABLE IF NOT EXISTS processed_emails (
+      message_id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      subject TEXT,
+      processed_at TEXT NOT NULL,
+      response_sent INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_thread ON processed_emails(thread_id);
   `);
+  logger.info('Tables created (if not existing).');
 
   // Add sender_name column if it doesn't exist (migration for existing DBs)
   try {
     db.exec(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
-  } catch {
-    /* column already exists */
+    logger.info('Migration: Added sender_name to messages table.');
+  } catch (e) {
+    logger.debug(`sender_name column already exists or error: ${e.message}`);
   }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -74,9 +90,11 @@ export function initDatabase(): void {
     db.exec(
       `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
     );
-  } catch {
-    /* column already exists */
+    logger.info('Migration: Added context_mode to scheduled_tasks table.');
+  } catch (e) {
+    logger.debug(`context_mode column already exists or error: ${e.message}`);
   }
+  logger.info('Database initialization complete.');
 }
 
 /**
@@ -185,6 +203,9 @@ export function storeMessage(
     msg.message?.videoMessage?.caption ||
     '';
 
+  // Skip storing empty messages (reactions, receipts, protocol messages, etc.)
+  if (!content.trim()) return;
+
   const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
   const sender = msg.key.participant || msg.key.remoteJid || '';
   const senderName = pushName || sender.split('@')[0];
@@ -212,10 +233,11 @@ export function getNewMessages(
 
   const placeholders = jids.map(() => '?').join(',');
   // Filter out bot's own messages by checking content prefix (not is_from_me, since user shares the account)
+  // Also filter out empty messages that may have slipped through
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND content NOT LIKE ?
+    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND content NOT LIKE ? AND content != ''
     ORDER BY timestamp
   `;
 
@@ -393,4 +415,21 @@ export function getTaskRunLogs(taskId: string, limit = 10): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
+}
+
+// Email tracking functions
+export function isEmailProcessed(messageId: string): boolean {
+  const row = db.prepare('SELECT 1 FROM processed_emails WHERE message_id = ?').get(messageId);
+  return !!row;
+}
+
+export function markEmailProcessed(messageId: string, threadId: string, sender: string, subject: string): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO processed_emails (message_id, thread_id, sender, subject, processed_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(messageId, threadId, sender, subject, new Date().toISOString());
+}
+
+export function markEmailResponded(messageId: string): void {
+  db.prepare('UPDATE processed_emails SET response_sent = 1 WHERE message_id = ?').run(messageId);
 }

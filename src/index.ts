@@ -1,10 +1,12 @@
 import { exec, execSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import makeWASocket, {
   DisconnectReason,
   WASocket,
+  fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -12,6 +14,8 @@ import makeWASocket, {
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  EMAIL_CHANNEL,
+  GROUPS_DIR,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
@@ -33,12 +37,17 @@ import {
   getNewMessages,
   getTaskById,
   initDatabase,
+  isEmailProcessed,
+  markEmailProcessed,
+  markEmailResponded,
   setLastGroupSync,
   storeChatMetadata,
   storeMessage,
   updateChatName,
 } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { checkForNewEmails, sendEmailReply, getContextKey, EmailMessage } from './email-channel.js';
+import { classifyMessage } from './message-classifier.js';
 import { NewMessage, RegisteredGroup, Session } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
@@ -56,6 +65,125 @@ let lidToPhoneMap: Record<string, string> = {};
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let groupSyncTimerStarted = false;
+// Reconnect backoff: prevents flooding WhatsApp with reconnect attempts
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000; // 5 min max
+// Claude quota tracking for Gemini failover
+let claudeQuotaExhaustedAt: number | null = null;
+const QUOTA_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+// Claude credentials path for OAuth usage API
+const CLAUDE_CREDENTIALS_PATH = path.join(
+  process.env.HOME || os.homedir(),
+  '.claude',
+  '.credentials.json',
+);
+
+/**
+ * Fetch real Claude usage from Anthropic API and write quota file for the agent.
+ */
+/**
+ * Calculate budget mode from usage % and time until reset.
+ *
+ * SPEND:    reset < 1h away AND usage < 80% → use Claude freely, don't waste subscription
+ * NORMAL:   usage < 50% → Claude handles most, delegates bulk/repetitive to Gemini
+ * CONSERVE: usage 50-85% → Claude orchestrates, delegates most execution to Gemini
+ * GUARDIAN: usage 85-95% → Claude only for decisions, bounded Gemini delegation
+ * LOCKED:   usage >= 95% → log tasks only
+ */
+function calcBudgetMode(
+  fiveHour: { utilization: number; resets_at: string | null } | undefined,
+  sevenDay: { utilization: number; resets_at: string | null } | undefined,
+): { mode: string; reason: string; hoursUntil5hReset: number; hoursUntil7dReset: number } {
+  const now = Date.now();
+  const fivePct = fiveHour?.utilization ?? 0;
+  const sevenPct = sevenDay?.utilization ?? 0;
+  const effectivePct = Math.max(fivePct, sevenPct);
+
+  const hoursUntil5hReset = fiveHour?.resets_at
+    ? Math.max(0, (new Date(fiveHour.resets_at).getTime() - now) / 3_600_000)
+    : 5;
+  const hoursUntil7dReset = sevenDay?.resets_at
+    ? Math.max(0, (new Date(sevenDay.resets_at).getTime() - now) / 3_600_000)
+    : 168;
+
+  // Near reset with quota left → spend it
+  if (hoursUntil5hReset < 1 && fivePct < 80) {
+    return { mode: 'SPEND', reason: `5h resets in ${hoursUntil5hReset.toFixed(1)}h, only ${fivePct}% used`, hoursUntil5hReset, hoursUntil7dReset };
+  }
+
+  if (effectivePct >= 95) {
+    return { mode: 'LOCKED', reason: `${effectivePct}% used`, hoursUntil5hReset, hoursUntil7dReset };
+  }
+  if (effectivePct >= 85) {
+    return { mode: 'GUARDIAN', reason: `${effectivePct}% used`, hoursUntil5hReset, hoursUntil7dReset };
+  }
+  if (effectivePct >= 50) {
+    return { mode: 'CONSERVE', reason: `${effectivePct}% used`, hoursUntil5hReset, hoursUntil7dReset };
+  }
+
+  return { mode: 'NORMAL', reason: `${effectivePct}% used`, hoursUntil5hReset, hoursUntil7dReset };
+}
+
+async function trackUsage(groupFolder: string, _model?: string | undefined): Promise<string | null> {
+  const usageFile = path.join(GROUPS_DIR, groupFolder, 'ai', '.usage.json');
+  try {
+    fs.mkdirSync(path.dirname(usageFile), { recursive: true });
+
+    // Read OAuth token
+    const creds = JSON.parse(fs.readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf-8'));
+    const token = creds?.claudeAiOauth?.accessToken;
+    if (!token) {
+      logger.debug('No OAuth token found, skipping usage tracking');
+      return null;
+    }
+
+    const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+    });
+
+    if (!res.ok) {
+      logger.debug({ status: res.status }, 'Usage API returned non-OK');
+      return null;
+    }
+
+    const data = await res.json() as {
+      five_hour?: { utilization: number; resets_at: string };
+      seven_day?: { utilization: number; resets_at: string };
+    };
+
+    const budget = calcBudgetMode(data.five_hour, data.seven_day);
+
+    fs.writeFileSync(usageFile, JSON.stringify({
+      five_hour_pct: data.five_hour?.utilization ?? 0,
+      five_hour_resets_at: data.five_hour?.resets_at ?? null,
+      hours_until_5h_reset: Math.round(budget.hoursUntil5hReset * 10) / 10,
+      seven_day_pct: data.seven_day?.utilization ?? 0,
+      seven_day_resets_at: data.seven_day?.resets_at ?? null,
+      hours_until_7d_reset: Math.round(budget.hoursUntil7dReset * 10) / 10,
+      budget_mode: budget.mode,
+      budget_reason: budget.reason,
+      exhausted: claudeQuotaExhaustedAt ? new Date(claudeQuotaExhaustedAt).toISOString() : null,
+      updated_at: new Date().toISOString(),
+    }, null, 2));
+
+    logger.info(
+      {
+        fiveHour: data.five_hour?.utilization,
+        sevenDay: data.seven_day?.utilization,
+        budgetMode: budget.mode,
+      },
+      'Usage tracked',
+    );
+
+    return budget.mode;
+  } catch (err) {
+    logger.debug({ err }, 'Failed to track usage');
+    return null;
+  }
+}
 
 /**
  * Translate a JID from LID format to phone format if we have a mapping.
@@ -182,6 +310,8 @@ async function processMessage(msg: NewMessage): Promise<void> {
   if (!group) return;
 
   const content = msg.content.trim();
+  if (!content) return; // Skip empty messages (reactions, receipts, protocol msgs)
+
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
   // Main group responds to all messages; other groups require trigger prefix
@@ -257,18 +387,131 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Write fresh usage data BEFORE container starts so the agent can read it
+  const budgetMode = await trackUsage(group.folder, undefined).catch(() => null);
+
+  // Model routing: use real-time quota data to decide
+  let model: 'claude' | 'gemini' | 'openrouter' | undefined;
+  const isEmergencyMode = budgetMode === 'GUARDIAN' || budgetMode === 'CONSERVE';
+  const isLocked = budgetMode === 'LOCKED';
+
+  if (claudeQuotaExhaustedAt) {
+    if (budgetMode && !isLocked && !isEmergencyMode) {
+      // Quota has recovered below 85% — clear the cooldown and use Claude
+      logger.info({ budgetMode }, 'Quota recovered, clearing Gemini cooldown');
+      claudeQuotaExhaustedAt = null;
+    } else if (Date.now() - claudeQuotaExhaustedAt < QUOTA_COOLDOWN_MS) {
+      model = 'gemini';
+      logger.info({ group: group.name }, 'Routing to Gemini (Claude quota cooldown active)');
+    }
+  }
+
+  // Emergency mode (85-95%): route to Gemini first, save Claude for complex failures
+  if (!model && (isEmergencyMode || isLocked)) {
+    model = 'gemini';
+    logger.info({ group: group.name, budgetMode }, 'Emergency mode: routing to Gemini first');
+  }
+
   try {
-    const output = await runContainerAgent(group, {
+    const input = {
       prompt,
       sessionId,
       groupFolder: group.folder,
       chatJid,
       isMain,
-    });
+      model,
+    };
+    const output = await runContainerAgent(group, input);
 
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
       saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+    }
+
+    // Track quota exhaustion from Claude
+    if (output.error?.includes('claude_quota_exhausted')) {
+      claudeQuotaExhaustedAt = Date.now();
+      logger.warn('Claude quota exhausted — Gemini failover active for 30 min');
+    }
+
+    // Notify user when free model handled the request
+    const freeModelHandled = (model === 'gemini' || model === 'openrouter')
+      || output.error?.includes('claude_error')
+      || output.error?.includes('claude_quota_exhausted');
+
+    if (freeModelHandled && output.status === 'success') {
+      await sendMessage(chatJid, `${ASSISTANT_NAME}: _Claude is conserving quota — free model here to help._`);
+    }
+
+    // Emergency mode fallback chain: Gemini failed → try OpenRouter → maybe Claude
+    if (output.status === 'error' && (isEmergencyMode || isLocked)) {
+      const geminiRateLimited = output.error?.includes('gemini_rate_limit');
+
+      if (geminiRateLimited || output.error?.includes('gemini')) {
+        logger.info({ group: group.name }, 'Emergency mode: Gemini failed, trying OpenRouter');
+        try {
+          const orOutput = await runContainerAgent(group, {
+            ...input,
+            model: 'openrouter',
+            sessionId: undefined, // fresh session for fallback
+          });
+
+          if (orOutput.status === 'success') {
+            await sendMessage(chatJid, `${ASSISTANT_NAME}: _Free model handling this request._`);
+            return orOutput.result;
+          }
+
+          // OpenRouter also failed — check if we should escalate to Claude
+          if (!isLocked) {
+            const classification = classifyMessage(prompt);
+            if (classification.score >= 40) {
+              logger.info(
+                { group: group.name, score: classification.score },
+                'Emergency mode: free models failed, escalating complex task to Claude',
+              );
+              const claudeOutput = await runContainerAgent(group, {
+                ...input,
+                model: 'claude',
+                sessionId,
+              });
+
+              if (claudeOutput.newSessionId) {
+                sessions[group.folder] = claudeOutput.newSessionId;
+                saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+              }
+
+              if (claudeOutput.status === 'success') return claudeOutput.result;
+            } else {
+              logger.info(
+                { group: group.name, score: classification.score },
+                'Emergency mode: simple task, not escalating to Claude',
+              );
+              await sendMessage(chatJid, `${ASSISTANT_NAME}: All free models are busy right now. Please try again in a few minutes.`);
+              return null;
+            }
+          } else {
+            // LOCKED: never use Claude
+            await sendMessage(chatJid, `${ASSISTANT_NAME}: All systems busy. Please try again in a few minutes.`);
+            return null;
+          }
+        } catch (orErr) {
+          logger.error({ err: orErr, group: group.name }, 'OpenRouter fallback failed');
+        }
+      }
+    }
+
+    // Generic retry for rate limit on both models (non-emergency path)
+    if (output.status === 'error' && output.error?.includes('gemini_rate_limit')) {
+      logger.warn({ group: group.name }, 'Both Claude and Gemini rate limited, queuing retry');
+      await sendMessage(chatJid, `${ASSISTANT_NAME}: All systems busy. Request queued. I will retry automatically in 2 minutes.`);
+      setTimeout(() => {
+        runAgent(group, prompt, chatJid).then(retryResult => {
+          if (retryResult) {
+            sendMessage(chatJid, `${ASSISTANT_NAME}: ${retryResult}`);
+          }
+        }).catch(err => logger.error({ err }, 'Queued retry failed'));
+      }, 120_000);
+      return null;
     }
 
     if (output.status === 'error') {
@@ -276,7 +519,20 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
+
+      // Clear stale session so next attempt starts fresh
+      if (sessionId) {
+        logger.info({ group: group.name, sessionId }, 'Clearing stale session after error');
+        delete sessions[group.folder];
+        saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+      }
+
       return null;
+    }
+
+    // Reset quota flag if Claude succeeded (no error marker)
+    if (!output.error?.includes('claude_quota_exhausted') && model !== 'gemini' && model !== 'openrouter') {
+      claudeQuotaExhaustedAt = null;
     }
 
     return output.result;
@@ -655,6 +911,16 @@ async function connectWhatsApp(): Promise<void> {
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
+  // Fetch latest WA Web version to avoid version mismatch disconnects
+  let waVersion: [number, number, number] | undefined;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    waVersion = version;
+    logger.info({ version: version.join('.') }, 'Fetched WA Web version');
+  } catch (err) {
+    logger.warn({ err }, 'Failed to fetch WA version, using Baileys default');
+  }
+
   sock = makeWASocket({
     auth: {
       creds: state.creds,
@@ -663,6 +929,9 @@ async function connectWhatsApp(): Promise<void> {
     printQRInTerminal: false,
     logger,
     browser: ['NanoClaw', 'Chrome', '1.0.0'],
+    ...(waVersion ? { version: waVersion } : {}),
+    connectTimeoutMs: 60000, // Increase timeout for WSL2 NAT latency
+    retryRequestDelayMs: 5000, // Longer retry delay for WSL2
   });
 
   sock.ev.on('connection.update', (update) => {
@@ -672,25 +941,28 @@ async function connectWhatsApp(): Promise<void> {
       const msg =
         'WhatsApp authentication required. Run /setup in Claude Code.';
       logger.error(msg);
-      exec(
-        `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
-      );
+      // Exit so systemd can restart — don't spin in a loop requesting QR codes
       setTimeout(() => process.exit(1), 1000);
     }
 
     if (connection === 'close') {
       const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      logger.info({ reason, shouldReconnect }, 'Connection closed');
+      logger.info({ reason, reconnectAttempts }, 'Connection closed');
 
-      if (shouldReconnect) {
-        logger.info('Reconnecting...');
-        connectWhatsApp();
-      } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
+      if (reason === DisconnectReason.loggedOut) {
+        logger.error('Logged out by WhatsApp. Clearing auth and exiting. Run /setup to re-authenticate.');
+        // Wipe auth so next startup goes straight to QR/pairing
+        fs.rmSync(authDir, { recursive: true, force: true });
+        process.exit(1);
       }
+
+      // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 64s, ... capped at 5 min
+      const delay = Math.min(2000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY_MS);
+      reconnectAttempts++;
+      logger.info({ delay, attempt: reconnectAttempts }, 'Reconnecting with backoff...');
+      setTimeout(() => connectWhatsApp(), delay);
     } else if (connection === 'open') {
+      reconnectAttempts = 0; // Reset backoff on successful connection
       logger.info('Connected to WhatsApp');
       
       // Build LID to phone mapping from auth state for self-chat translation
@@ -723,6 +995,7 @@ async function connectWhatsApp(): Promise<void> {
       });
       startIpcWatcher();
       startMessageLoop();
+      startEmailLoop();
     }
   });
 
@@ -794,43 +1067,136 @@ async function startMessageLoop(): Promise<void> {
   }
 }
 
+async function runEmailAgent(
+  contextKey: string,
+  prompt: string,
+  email: EmailMessage
+): Promise<string | null> {
+  // Email uses either main group context or dynamic folders per thread/sender
+  const groupFolder = EMAIL_CHANNEL.contextMode === 'single'
+    ? MAIN_GROUP_FOLDER  // Use main group context
+    : `email/${contextKey}`;  // Isolated email context
+
+  // Ensure folder exists
+  const groupDir = path.join(process.cwd(), 'groups', groupFolder);
+  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+
+  // Create minimal CLAUDE.md for email groups if it doesn't exist
+  const claudeMdPath = path.join(groupDir, 'CLAUDE.md');
+  if (!fs.existsSync(claudeMdPath)) {
+    fs.writeFileSync(claudeMdPath, `# Email Channel\n\nYou are responding to emails. Your responses will be sent as email replies.\n\n## Guidelines\n\n- Be professional and clear\n- Keep responses concise but complete\n- Use proper email formatting (greetings, sign-off)\n- If the email requires action you can't take, explain what the user should do\n\n## Context\n\nEach email thread has its own conversation history.\n`);
+  }
+
+  // Create minimal registered group for email
+  const emailGroup: RegisteredGroup = {
+    name: contextKey,
+    folder: groupFolder,
+    trigger: '',  // No trigger for email
+    added_at: new Date().toISOString()
+  };
+
+  try {
+    // Use existing runContainerAgent
+    const output = await runContainerAgent(emailGroup, {
+      prompt,
+      sessionId: sessions[groupFolder],
+      groupFolder,
+      chatJid: `email:${email.from}`,  // Use email: prefix for JID
+      isMain: false,
+      isScheduledTask: false
+    });
+
+    if (output.newSessionId) {
+      sessions[groupFolder] = output.newSessionId;
+      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+    }
+
+    return output.status === 'success' ? output.result : null;
+  } catch (err) {
+    logger.error({ err, email: email.from }, 'Email agent failed');
+    return null;
+  }
+}
+
+async function startEmailLoop(): Promise<void> {
+  if (!EMAIL_CHANNEL.enabled) {
+    logger.info('Email channel disabled');
+    return;
+  }
+
+  logger.info(`Email channel running (trigger: ${EMAIL_CHANNEL.triggerMode}:${EMAIL_CHANNEL.triggerValue})`);
+
+  // Run email polling loop
+  while (true) {
+    try {
+      const emails = await checkForNewEmails();
+
+      for (const email of emails) {
+        if (isEmailProcessed(email.id)) continue;
+
+        logger.info({ from: email.from, subject: email.subject }, 'Processing email');
+        markEmailProcessed(email.id, email.threadId, email.from, email.subject);
+
+        // Determine which group/context to use
+        const contextKey = getContextKey(email);
+
+        // Build prompt with email content
+        const prompt = `<email>
+<from>${email.from}</from>
+<subject>${email.subject}</subject>
+<body>${email.body}</body>
+</email>
+
+Respond to this email. Your response will be sent as an email reply.`;
+
+        // Run agent with email context
+        const response = await runEmailAgent(contextKey, prompt, email);
+
+        if (response) {
+          await sendEmailReply(email.threadId, email.from, email.subject, response);
+          markEmailResponded(email.id);
+          logger.info({ to: email.from }, 'Email reply sent');
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error in email loop');
+    }
+
+    await new Promise(resolve => setTimeout(resolve, EMAIL_CHANNEL.pollIntervalMs));
+  }
+}
+
 function ensureContainerSystemRunning(): void {
   try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
+    execSync('docker info', { stdio: 'pipe' });
+    logger.debug('Docker is running');
   } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
-    }
+    logger.error('Docker is not running');
+    console.error(
+      '\n╔════════════════════════════════════════════════════════════════╗',
+    );
+    console.error(
+      '║  FATAL: Docker is not running                                  ║',
+    );
+    console.error(
+      '║                                                                ║',
+    );
+    console.error(
+      '║  Agents cannot run without Docker. To fix:                    ║',
+    );
+    console.error(
+      '║  1. Start Docker daemon: sudo dockerd &                       ║',
+    );
+    console.error(
+      '║  2. Or on systemd: sudo systemctl start docker                ║',
+    );
+    console.error(
+      '║  3. Restart NanoClaw                                          ║',
+    );
+    console.error(
+      '╚════════════════════════════════════════════════════════════════╝\n',
+    );
+    throw new Error('Docker is required but not running');
   }
 }
 

@@ -39,6 +39,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  model?: 'claude' | 'gemini' | 'openrouter';
 }
 
 export interface ContainerOutput {
@@ -105,6 +106,21 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+
+  // Copy OAuth credentials from main .claude/ if available
+  const mainCredentialsPath = path.join(homeDir, '.claude', '.credentials.json');
+  const groupCredentialsPath = path.join(groupSessionsDir, '.credentials.json');
+  if (fs.existsSync(mainCredentialsPath)) {
+    try {
+      fs.copyFileSync(mainCredentialsPath, groupCredentialsPath);
+    } catch (err) {
+      logger.warn(
+        { error: err, group: group.name },
+        'Failed to copy OAuth credentials to group session dir',
+      );
+    }
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
@@ -129,7 +145,7 @@ function buildVolumeMounts(
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -147,6 +163,16 @@ function buildVolumeMounts(
         readonly: true,
       });
     }
+  }
+
+  // Gmail credentials directory (for email integration)
+  const gmailDir = path.join(homeDir, '.gmail-mcp');
+  if (fs.existsSync(gmailDir)) {
+    mounts.push({
+      hostPath: gmailDir,
+      containerPath: '/home/node/.gmail-mcp',
+      readonly: false,  // MCP may need to refresh tokens
+    });
   }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
@@ -219,7 +245,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn('docker', containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 

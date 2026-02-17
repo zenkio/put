@@ -7,6 +7,8 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { createIpcMcp } from './ipc-mcp.js';
+import { runGeminiFallback } from './gemini-fallback.js';
+import { runOpenRouterFallback } from './openrouter-fallback.js';
 
 interface ContainerInput {
   prompt: string;
@@ -15,6 +17,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  model?: 'claude' | 'gemini' | 'openrouter';
 }
 
 interface ContainerOutput {
@@ -200,22 +203,12 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   return lines.join('\n');
 }
 
-async function main(): Promise<void> {
-  let input: ContainerInput;
+function isQuotaError(error: string): boolean {
+  const lower = error.toLowerCase();
+  return lower.includes('429') || lower.includes('quota') || lower.includes('rate_limit') || lower.includes('overloaded');
+}
 
-  try {
-    const stdinData = await readStdin();
-    input = JSON.parse(stdinData);
-    log(`Received input for group: ${input.groupFolder}`);
-  } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
-    process.exit(1);
-  }
-
+async function runClaudeAgent(input: ContainerInput, prompt: string): Promise<ContainerOutput & { newSessionId?: string }> {
   const ipcMcp = createIpcMcp({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
@@ -225,64 +218,215 @@ async function main(): Promise<void> {
   let result: string | null = null;
   let newSessionId: string | undefined;
 
+  for await (const message of query({
+    prompt,
+    options: {
+      cwd: '/workspace/group',
+      resume: input.sessionId,
+      allowedTools: [
+        'Bash',
+        'Read', 'Write', 'Edit', 'Glob', 'Grep',
+        'WebSearch', 'WebFetch',
+        'mcp__nanoclaw__*',
+        'mcp__gmail__*',
+        'mcp__zen__*'
+      ],
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      settingSources: ['project'],
+      mcpServers: {
+        nanoclaw: ipcMcp,
+        gmail: { command: 'npx', args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'] },
+        zen: { command: 'uvx', args: ['--from', 'git+https://github.com/jray2123/zen-mcp-server.git', 'zen-mcp-server'] }
+      },
+      hooks: {
+        PreCompact: [{ hooks: [createPreCompactHook()] }]
+      }
+    }
+  })) {
+    if (message.type === 'system' && message.subtype === 'init') {
+      newSessionId = message.session_id;
+      log(`Session initialized: ${newSessionId}`);
+    }
+
+    if ('result' in message && message.result) {
+      result = message.result as string;
+    }
+  }
+
+  return { status: 'success', result, newSessionId };
+}
+
+async function main(): Promise<void> {
+  let input: ContainerInput;
+
+  try {
+    const stdinData = await readStdin();
+    input = JSON.parse(stdinData);
+    log(`Received input for group: ${input.groupFolder}, model: ${input.model || 'claude'}`);
+  } catch (err) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+    });
+    process.exit(1);
+  }
+
   // Add context for scheduled tasks
   let prompt = input.prompt;
   if (input.isScheduledTask) {
     prompt = `[SCHEDULED TASK - You are running automatically, not in response to a user message. Use mcp__nanoclaw__send_message if needed to communicate with the user.]\n\n${input.prompt}`;
   }
 
-  try {
-    log('Starting agent...');
-
-    for await (const message of query({
+  // Direct Gemini routing (when host knows Claude quota is exhausted)
+  if (input.model === 'gemini') {
+    log('Routed directly to Gemini fallback');
+    const output = await runGeminiFallback({
       prompt,
-      options: {
-        cwd: '/workspace/group',
-        resume: input.sessionId,
-        allowedTools: [
-          'Bash',
-          'Read', 'Write', 'Edit', 'Glob', 'Grep',
-          'WebSearch', 'WebFetch',
-          'mcp__nanoclaw__*'
-        ],
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        settingSources: ['project'],
-        mcpServers: {
-          nanoclaw: ipcMcp
-        },
-        hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook()] }]
-        }
-      }
-    })) {
-      if (message.type === 'system' && message.subtype === 'init') {
-        newSessionId = message.session_id;
-        log(`Session initialized: ${newSessionId}`);
-      }
+      chatJid: input.chatJid,
+      groupFolder: input.groupFolder,
+      isMain: input.isMain
+    });
+    writeOutput(output);
+    if (output.status === 'error') process.exit(1);
+    return;
+  }
 
-      if ('result' in message && message.result) {
-        result = message.result as string;
-      }
+  // Direct OpenRouter routing (emergency mode fallback)
+  if (input.model === 'openrouter') {
+    log('Routed directly to OpenRouter fallback');
+    const output = await runOpenRouterFallback({
+      prompt,
+      chatJid: input.chatJid,
+      groupFolder: input.groupFolder,
+      isMain: input.isMain
+    });
+
+    if (output.status === 'success') {
+      writeOutput(output);
+      return;
     }
 
-    log('Agent completed successfully');
-    writeOutput({
-      status: 'success',
-      result,
-      newSessionId
+    // OpenRouter failed — try Gemini as backup
+    log('OpenRouter failed, trying Gemini as backup...');
+    const geminiOutput = await runGeminiFallback({
+      prompt,
+      chatJid: input.chatJid,
+      groupFolder: input.groupFolder,
+      isMain: input.isMain
     });
+    writeOutput(geminiOutput);
+    if (geminiOutput.status === 'error') process.exit(1);
+    return;
+  }
 
+  // Default: try Claude first, fallback to Gemini on ANY error
+  try {
+    log('Starting Claude agent...');
+    const output = await runClaudeAgent(input, prompt);
+    log('Claude agent completed successfully');
+    writeOutput({
+      status: output.status,
+      result: output.result,
+      newSessionId: output.newSessionId
+    });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId,
-      error: errorMessage
-    });
-    process.exit(1);
+    log(`Claude agent error: ${errorMessage}`);
+
+    const quotaError = isQuotaError(errorMessage);
+    const errorTag = quotaError ? 'claude_quota_exhausted' : 'claude_error';
+
+    if (quotaError) {
+      log('Claude quota/rate limit detected, falling back to Gemini...');
+    } else {
+      log('Claude crashed, falling back to Gemini so user gets a response...');
+    }
+
+    // Write IPC notification for quota alerts
+    if (quotaError) {
+      const ipcNotifyDir = path.join('/workspace/ipc', 'messages');
+      fs.mkdirSync(ipcNotifyDir, { recursive: true });
+      const notifyFile = path.join(ipcNotifyDir, `${Date.now()}-quota-alert.json`);
+      fs.writeFileSync(notifyFile, JSON.stringify({
+        type: 'message',
+        chatJid: input.chatJid,
+        text: '[QUOTA ALERT] Claude is resting. Switching to Gemini for this request.',
+        groupFolder: input.groupFolder,
+        timestamp: new Date().toISOString()
+      }));
+    }
+
+    try {
+      const geminiOutput = await runGeminiFallback({
+        prompt,
+        chatJid: input.chatJid,
+        groupFolder: input.groupFolder,
+        isMain: input.isMain
+      });
+
+      if (geminiOutput.status === 'success') {
+        writeOutput({ ...geminiOutput, error: errorTag });
+      } else if (geminiOutput.error?.includes('gemini_rate_limit')) {
+        // Gemini also rate limited — try OpenRouter as last resort
+        log('Gemini rate limited, trying OpenRouter as last resort...');
+        try {
+          const openRouterOutput = await runOpenRouterFallback({
+            prompt,
+            chatJid: input.chatJid,
+            groupFolder: input.groupFolder,
+            isMain: input.isMain
+          });
+
+          if (openRouterOutput.status === 'success') {
+            writeOutput({ ...openRouterOutput, error: `${errorTag}|gemini_rate_limit|openrouter_used` });
+          } else {
+            writeOutput({ ...geminiOutput, error: `${errorTag}|${geminiOutput.error}|openrouter_failed` });
+            process.exit(1);
+          }
+        } catch (orErr) {
+          log(`OpenRouter fallback error: ${orErr instanceof Error ? orErr.message : String(orErr)}`);
+          writeOutput({ ...geminiOutput, error: `${errorTag}|${geminiOutput.error}` });
+          process.exit(1);
+        }
+      } else {
+        writeOutput({ ...geminiOutput, error: `${errorTag}|${geminiOutput.error}` });
+        process.exit(1);
+      }
+    } catch (geminiErr) {
+      const geminiErrMsg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
+      log(`Gemini fallback also failed: ${geminiErrMsg}`);
+
+      // Last resort: try OpenRouter (free models)
+      const isGeminiRateLimit = geminiErrMsg.includes('429') || geminiErrMsg.toLowerCase().includes('rate');
+      if (isGeminiRateLimit) {
+        log('Gemini rate limited, trying OpenRouter as last resort...');
+        try {
+          const openRouterOutput = await runOpenRouterFallback({
+            prompt,
+            chatJid: input.chatJid,
+            groupFolder: input.groupFolder,
+            isMain: input.isMain
+          });
+
+          if (openRouterOutput.status === 'success') {
+            writeOutput({ ...openRouterOutput, error: `${errorTag}|gemini_failed|openrouter_used` });
+            return;
+          }
+          log(`OpenRouter also failed: ${openRouterOutput.error}`);
+        } catch (orErr) {
+          log(`OpenRouter fallback error: ${orErr instanceof Error ? orErr.message : String(orErr)}`);
+        }
+      }
+
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: `${errorTag}|gemini_also_failed`
+      });
+      process.exit(1);
+    }
   }
 }
 

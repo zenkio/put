@@ -23,7 +23,14 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Python package manager) and pre-install zen-mcp-server
+RUN pip3 install uv --break-system-packages
+RUN uvx --from git+https://github.com/jray2123/zen-mcp-server.git zen-mcp --version || true
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
