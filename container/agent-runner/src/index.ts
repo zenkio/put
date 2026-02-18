@@ -9,6 +9,7 @@ import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-a
 import { createIpcMcp } from './ipc-mcp.js';
 import { runGeminiFallback } from './gemini-fallback.js';
 import { runOpenRouterFallback } from './openrouter-fallback.js';
+import { runPhi3Fallback } from './phi3-fallback.js';
 
 interface ContainerInput {
   prompt: string;
@@ -17,7 +18,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  model?: 'claude' | 'gemini' | 'openrouter';
+  model?: 'claude' | 'gemini' | 'openrouter' | 'phi3';
 }
 
 interface ContainerOutput {
@@ -283,6 +284,20 @@ async function main(): Promise<void> {
   if (input.model === 'gemini') {
     log('Routed directly to Gemini fallback');
     const output = await runGeminiFallback({
+      prompt,
+      chatJid: input.chatJid,
+      groupFolder: input.groupFolder,
+      isMain: input.isMain
+    });
+    writeOutput(output);
+    if (output.status === 'error') process.exit(1);
+    return;
+  }
+
+  // Direct Phi3 routing
+  if (input.model === 'phi3') {
+    log('Routed directly to Phi3 fallback');
+    const output = await runPhi3Fallback({
       prompt,
       chatJid: input.chatJid,
       groupFolder: input.groupFolder,

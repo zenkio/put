@@ -362,184 +362,80 @@ async function runAgent(
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
+  // 1. Snapshot tasks and groups for the container
   const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
+  writeTasksSnapshot(group.folder, isMain, tasks.map(t => ({
+    id: t.id, groupFolder: t.group_folder, prompt: t.prompt,
+    schedule_type: t.schedule_type, schedule_value: t.schedule_value,
+    status: t.status, next_run: t.next_run,
+  })));
 
-  // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
+  writeGroupsSnapshot(group.folder, isMain, availableGroups, new Set(Object.keys(registeredGroups)));
 
-  // Write fresh usage data BEFORE container starts so the agent can read it
+  // 2. Track Claude usage
   const budgetMode = await trackUsage(group.folder, undefined).catch(() => null);
+  const isClaudeAvailable = budgetMode !== 'LOCKED' && !claudeQuotaExhaustedAt;
 
-  // Model routing: use real-time quota data to decide
-  let model: 'claude' | 'gemini' | 'openrouter' | undefined;
-  const isEmergencyMode = budgetMode === 'GUARDIAN' || budgetMode === 'CONSERVE';
-  const isLocked = budgetMode === 'LOCKED';
-
-  if (claudeQuotaExhaustedAt) {
-    if (budgetMode && !isLocked && !isEmergencyMode) {
-      // Quota has recovered below 85% — clear the cooldown and use Claude
-      logger.info({ budgetMode }, 'Quota recovered, clearing Gemini cooldown');
-      claudeQuotaExhaustedAt = null;
-    } else if (Date.now() - claudeQuotaExhaustedAt < QUOTA_COOLDOWN_MS) {
-      model = 'gemini';
-      logger.info({ group: group.name }, 'Routing to Gemini (Claude quota cooldown active)');
-    }
+  // 3. Sequential Escalation Loop
+  const modelsToTry: Array<'phi3' | 'claude' | 'gemini' | 'openrouter'> = ['phi3'];
+  
+  if (isClaudeAvailable) {
+    modelsToTry.push('claude');
   }
+  modelsToTry.push('gemini');
+  modelsToTry.push('openrouter');
 
-  // Emergency mode (85-95%): route to Gemini first, save Claude for complex failures
-  if (!model && (isEmergencyMode || isLocked)) {
-    model = 'gemini';
-    logger.info({ group: group.name, budgetMode }, 'Emergency mode: routing to Gemini first');
-  }
+  let lastResult: string | null = null;
+  let lastError: string | undefined;
 
-  try {
-    const input = {
-      prompt,
-      sessionId,
-      groupFolder: group.folder,
-      chatJid,
-      isMain,
-      model,
-    };
-    const output = await runContainerAgent(group, input);
+  for (const model of modelsToTry) {
+    logger.info({ group: group.name, model }, `Attempting task with model`);
+    
+    try {
+      const input = {
+        prompt,
+        sessionId: model === 'claude' ? sessionId : undefined, // Sessions primarily for Claude
+        groupFolder: group.folder,
+        chatJid,
+        isMain,
+        model,
+      };
 
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-    }
+      const output = await runContainerAgent(group, input);
 
-    // Track quota exhaustion from Claude
-    if (output.error?.includes('claude_quota_exhausted')) {
-      claudeQuotaExhaustedAt = Date.now();
-      logger.warn('Claude quota exhausted — Gemini failover active for 30 min');
-    }
-
-    // Notify user when free model handled the request
-    const freeModelHandled = (model === 'gemini' || model === 'openrouter')
-      || output.error?.includes('claude_error')
-      || output.error?.includes('claude_quota_exhausted');
-
-    if (freeModelHandled && output.status === 'success') {
-      await sendMessage(chatJid, `${ASSISTANT_NAME}: _Claude is conserving quota — free model here to help._`);
-    }
-
-    // Emergency mode fallback chain: Gemini failed → try OpenRouter → maybe Claude
-    if (output.status === 'error' && (isEmergencyMode || isLocked)) {
-      const geminiRateLimited = output.error?.includes('gemini_rate_limit');
-
-      if (geminiRateLimited || output.error?.includes('gemini')) {
-        logger.info({ group: group.name }, 'Emergency mode: Gemini failed, trying OpenRouter');
-        try {
-          const orOutput = await runContainerAgent(group, {
-            ...input,
-            model: 'openrouter',
-            sessionId: undefined, // fresh session for fallback
-          });
-
-          if (orOutput.status === 'success') {
-            await sendMessage(chatJid, `${ASSISTANT_NAME}: _Free model handling this request._`);
-            return orOutput.result;
-          }
-
-          // OpenRouter also failed — check if we should escalate to Claude
-          if (!isLocked) {
-            const classification = classifyMessage(prompt);
-            if (classification.score >= 40) {
-              logger.info(
-                { group: group.name, score: classification.score },
-                'Emergency mode: free models failed, escalating complex task to Claude',
-              );
-              const claudeOutput = await runContainerAgent(group, {
-                ...input,
-                model: 'claude',
-                sessionId,
-              });
-
-              if (claudeOutput.newSessionId) {
-                sessions[group.folder] = claudeOutput.newSessionId;
-                saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-              }
-
-              if (claudeOutput.status === 'success') return claudeOutput.result;
-            } else {
-              logger.info(
-                { group: group.name, score: classification.score },
-                'Emergency mode: simple task, not escalating to Claude',
-              );
-              await sendMessage(chatJid, `${ASSISTANT_NAME}: All free models are busy right now. Please try again in a few minutes.`);
-              return null;
-            }
-          } else {
-            // LOCKED: never use Claude
-            await sendMessage(chatJid, `${ASSISTANT_NAME}: All systems busy. Please try again in a few minutes.`);
-            return null;
-          }
-        } catch (orErr) {
-          logger.error({ err: orErr, group: group.name }, 'OpenRouter fallback failed');
+      if (output.status === 'success' && output.result) {
+        if (output.newSessionId && model === 'claude') {
+          sessions[group.folder] = output.newSessionId;
+          saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
         }
-      }
-    }
+        
+        // If Phi-3 was used and it didn't explicitly ask for escalation, we're done
+        if (model === 'phi3' && output.result.includes('ESCALATE_TO_PREMIUM')) {
+          logger.info({ group: group.name }, 'Phi-3 requested escalation');
+          continue;
+        }
 
-    // Generic retry for rate limit on both models (non-emergency path)
-    if (output.status === 'error' && output.error?.includes('gemini_rate_limit')) {
-      logger.warn({ group: group.name }, 'Both Claude and Gemini rate limited, queuing retry');
-      await sendMessage(chatJid, `${ASSISTANT_NAME}: All systems busy. Request queued. I will retry automatically in 2 minutes.`);
-      setTimeout(() => {
-        runAgent(group, prompt, chatJid).then(retryResult => {
-          if (retryResult) {
-            sendMessage(chatJid, `${ASSISTANT_NAME}: ${retryResult}`);
-          }
-        }).catch(err => logger.error({ err }, 'Queued retry failed'));
-      }, 120_000);
-      return null;
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-
-      // Clear stale session so next attempt starts fresh
-      if (sessionId) {
-        logger.info({ group: group.name, sessionId }, 'Clearing stale session after error');
-        delete sessions[group.folder];
-        saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+        return output.result;
       }
 
-      return null;
-    }
+      lastError = output.error;
+      
+      // Track Claude quota exhaustion specifically
+      if (model === 'claude' && lastError?.includes('claude_quota_exhausted')) {
+        claudeQuotaExhaustedAt = Date.now();
+        logger.warn('Claude quota exhausted during run');
+      }
 
-    // Reset quota flag if Claude succeeded (no error marker)
-    if (!output.error?.includes('claude_quota_exhausted') && model !== 'gemini' && model !== 'openrouter') {
-      claudeQuotaExhaustedAt = null;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.error({ group: group.name, model, err }, 'Model attempt failed with exception');
     }
-
-    return output.result;
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return null;
   }
+
+  // If we're here, everything failed
+  await sendMessage(chatJid, `${ASSISTANT_NAME}: I encountered an issue processing your request across all available systems. Please try again later.`);
+  return null;
 }
 
 async function sendMessage(jid: string, text: string): Promise<void> {
@@ -792,6 +688,38 @@ async function processTaskIpc(
           { taskId, sourceGroup, targetGroup, contextMode },
           'Task created via IPC',
         );
+      }
+      break;
+
+    case 'delegate_agent':
+      if (data.agent && data.prompt && data.groupFolder && data.chatJid) {
+        // Authorization: ensure source group is allowed to delegate to this agent
+        const targetGroup = registeredGroups[data.chatJid];
+        if (!isMain && (!targetGroup || targetGroup.folder !== data.groupFolder)) {
+          logger.warn(
+            { sourceGroup, targetAgent: data.agent, targetGroup: data.groupFolder },
+            'Unauthorized delegate_agent attempt blocked',
+          );
+          break;
+        }
+
+        logger.info(
+          { sourceGroup, targetAgent: data.agent, targetGroup: data.groupFolder },
+          'Delegating task via IPC',
+        );
+
+        // Re-run agent with the delegated model
+        const groupToRun = Object.values(registeredGroups).find(g => g.folder === data.groupFolder);
+        if (groupToRun) {
+          // Do not wait for response, as it will block the IPC watcher
+          runAgent(groupToRun, data.prompt, data.chatJid, data.agent as any)
+            .catch(err => logger.error({ err }, 'Delegated agent run failed'));
+        } else {
+          logger.error(
+            { targetGroup: data.groupFolder },
+            'Could not find registered group for delegated agent',
+          );
+        }
       }
       break;
 

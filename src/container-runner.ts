@@ -39,7 +39,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  model?: 'claude' | 'gemini' | 'openrouter';
+  model?: 'claude' | 'gemini' | 'openrouter' | 'phi3';
 }
 
 export interface ContainerOutput {
@@ -189,7 +189,7 @@ function buildVolumeMounts(
 }
 
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
-  const args: string[] = ['run', '-i', '--rm'];
+  const args: string[] = ['run', '-i', '--rm', '--add-host=host.docker.internal:host-gateway'];
 
   // Apple Container: --mount for readonly, -v for read-write
   for (const mount of mounts) {

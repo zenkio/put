@@ -4,13 +4,10 @@
  * Provides the same tools as the Gemini fallback (bash, file ops, IPC messaging).
  */
 
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { executeSharedTool } from './tool-utils.js';
 
-const IPC_DIR = '/workspace/ipc';
-const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
-const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const MAX_ITERATIONS = 15;
 const API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const MODELS_URL = 'https://openrouter.ai/api/v1/models';
@@ -62,16 +59,6 @@ function log(message: string): void {
   console.error(`[openrouter-fallback] ${message}`);
 }
 
-function writeIpcFile(dir: string, data: object): string {
-  fs.mkdirSync(dir, { recursive: true });
-  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
-  const filepath = path.join(dir, filename);
-  const tempPath = `${filepath}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
-  fs.renameSync(tempPath, filepath);
-  return filename;
-}
-
 function stripOrchestration(content: string): string {
   const skipHeadings = ['Delegation & Quota', 'Before Every Response', 'Orchestration Protocol', 'MANDATORY: Read Quota'];
   const lines = content.split('\n');
@@ -99,13 +86,13 @@ function loadSystemPrompt(isDirect: boolean): string {
       'You are responding directly to a WhatsApp conversation. The user is talking to you.',
       'Be helpful, conversational, and complete. You are NOT a worker — you are the primary assistant.',
       '',
-      'You have tools: bash, read_file, write_file, list_files, send_message, schedule_task.',
+      'You have tools: bash, read_file, write_file, list_files, send_message, schedule_task, delegate_to_claude, delegate_to_gemini, delegate_to_phi3.',
       'Work directory: /workspace/group/',
       '',
       '- Respond naturally as a personal assistant',
       '- Use send_message for long tasks to keep the user informed',
-      '- Do NOT delegate to other workers or call gemini-worker/openrouter-worker',
-      '- Do NOT read .usage.json — you are already handling this because Claude is unavailable',
+      '- If a task requires complex coding or deep analysis, use delegate_to_claude.',
+      '- If a task requires general knowledge or creative writing, use delegate_to_phi3.',
     );
   } else {
     // Worker mode: Claude delegated a specific task
@@ -114,7 +101,7 @@ function loadSystemPrompt(isDirect: boolean): string {
       'You are an OpenRouter worker. Claude delegated a specific task to you.',
       'Execute the task in the user prompt and return the result. That\'s it.',
       '- Do NOT read .usage.json or PROJECT_STATE.md',
-      '- Do NOT delegate to other workers or call gemini-worker/openrouter-worker',
+      '- Do NOT delegate to other workers',
       '- Do NOT use send_message unless the task explicitly asks you to send a WhatsApp message',
       '- Do NOT modify PROJECT_STATE.md or TASK_QUEUE.md',
       '- Just do the task and respond with the answer',
@@ -233,100 +220,49 @@ const toolDefinitions = [
       },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'delegate_to_claude',
+      description: 'Delegate a complex task to Claude for execution.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'The task for Claude' },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'delegate_to_gemini',
+      description: 'Delegate a task to Gemini for execution.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'The task for Gemini' },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'delegate_to_phi3',
+      description: 'Delegate a task to Phi3 for execution.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'The task for Phi3' },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
 ];
-
-function executeTool(
-  name: string,
-  args: Record<string, unknown>,
-  ctx: { chatJid: string; groupFolder: string; isMain: boolean },
-): string {
-  try {
-    switch (name) {
-      case 'bash': {
-        const cmd = args.command as string;
-        log(`bash: ${cmd.slice(0, 100)}`);
-        const output = execSync(cmd, {
-          cwd: '/workspace/group',
-          timeout: 30_000,
-          maxBuffer: 1024 * 1024,
-          encoding: 'utf-8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        return output || '(no output)';
-      }
-
-      case 'read_file': {
-        const filePath = args.path as string;
-        if (!fs.existsSync(filePath)) return `Error: File not found: ${filePath}`;
-        return fs.readFileSync(filePath, 'utf-8');
-      }
-
-      case 'write_file': {
-        const filePath = args.path as string;
-        const content = args.content as string;
-        fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, content);
-        return `Written to ${filePath}`;
-      }
-
-      case 'list_files': {
-        const dirPath = args.path as string;
-        if (!fs.existsSync(dirPath)) return `Error: Directory not found: ${dirPath}`;
-        const recursive = args.recursive as boolean;
-        if (recursive) {
-          const result: string[] = [];
-          const walk = (dir: string, prefix: string) => {
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-              const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-              if (entry.isDirectory()) {
-                walk(path.join(dir, entry.name), rel);
-              } else {
-                result.push(rel);
-              }
-            }
-          };
-          walk(dirPath, '');
-          return result.join('\n') || '(empty directory)';
-        }
-        const entries = fs.readdirSync(dirPath);
-        return entries.join('\n') || '(empty directory)';
-      }
-
-      case 'send_message': {
-        const text = args.text as string;
-        writeIpcFile(MESSAGES_DIR, {
-          type: 'message',
-          chatJid: ctx.chatJid,
-          text,
-          groupFolder: ctx.groupFolder,
-          timestamp: new Date().toISOString(),
-        });
-        return 'Message queued for delivery.';
-      }
-
-      case 'schedule_task': {
-        writeIpcFile(TASKS_DIR, {
-          type: 'schedule_task',
-          prompt: args.prompt as string,
-          schedule_type: args.schedule_type as string,
-          schedule_value: args.schedule_value as string,
-          context_mode: (args.context_mode as string) || 'group',
-          groupFolder: ctx.groupFolder,
-          chatJid: ctx.chatJid,
-          timestamp: new Date().toISOString(),
-        });
-        return 'Task scheduled.';
-      }
-
-      default:
-        return `Unknown tool: ${name}`;
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(`Tool error (${name}): ${msg}`);
-    return `Error: ${msg}`;
-  }
-}
 
 const WORKER_STATUS_FILE = '/workspace/group/ai/.worker-status.json';
 
@@ -577,7 +513,7 @@ async function tryModel(
         log(`Failed to parse tool args for ${fnName}`);
       }
 
-      const result = executeTool(fnName, args, ctx);
+      const result = executeSharedTool(fnName, args, ctx);
       const truncated = result.length > 10000 ? result.slice(0, 10000) + '\n...(truncated)' : result;
 
       messages.push({
