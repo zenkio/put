@@ -157,51 +157,10 @@ Update `/workspace/group/ai/PROJECT_STATE.md` with:
 
 ---
 
+---
 ## Web App Deployment
 
-**Always deploy to local preview first. Only deploy to Netlify after the user confirms the preview is good.**
-
-### CRITICAL RULES
-
-- **DO NOT modify config files** (`vite.config.ts`, `react-router.config.ts`, `tsconfig.json`) unless explicitly asked. Adding `base` or `basename` config crashed the app.
-- **DO NOT refactor working code** you weren't asked to change. Previous incident: Claude refactored context imports, useLocalStorage hook, and added basename config alongside a navigation fix — the refactoring caused a runtime crash ("Oops! An unexpected error occurred").
-- **Only change what was requested.** If asked to fix navigation, only fix navigation. Don't "improve" surrounding code.
-- **Test the preview URL yourself** after deploying — use `curl` to verify the page returns valid HTML, not an error page.
-
-### Deploy to Preview (Default)
-
-Copy built files to the preview directory. The preview server serves the active project at root `/`:
-
-```bash
-# Build the project
-cd /workspace/group/projects/jambutter && npm run build
-
-# Deploy to local preview server
-rm -rf /workspace/project/data/preview/jambutter
-cp -r build/client /workspace/project/data/preview/jambutter
-```
-
-The preview is served at root:
-- `http://localhost:8080/` (active project)
-- `http://localhost:8080/_projects` (switch between projects)
-
-### Deploy to Netlify (Only After User Confirms)
-
-Only deploy to Netlify when the user explicitly says the preview looks good:
-
-```bash
-cd /workspace/group/projects/jambutter && node deploy.cjs
-```
-
-### Workflow
-
-1. Build the app
-2. Deploy to preview: `rm -rf ... && cp -r build/client /workspace/project/data/preview/{project-name}`
-3. Verify with curl: `curl -s http://localhost:8080/ | head -5` (should show valid HTML)
-4. Tell the user: "Preview ready at http://localhost:8080/"
-5. Wait for user confirmation
-6. If confirmed → deploy to Netlify
-7. If issues found → fix ONLY what's broken, rebuild, re-deploy to preview
+General preview/Netlify workflow, verification steps, and the “deploy only after preview is confirmed” rule now live in `/workspace/project/groups/global/NETLIFY.md`. Refer to that file for the up-to-date process before touching deployments, and keep JamButter-specific URLs/notes inside the JamButter project folder (`/workspace/project/groups/jambutter-project/CLAUDE.md`).
 
 ---
 

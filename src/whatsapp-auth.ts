@@ -7,6 +7,7 @@
  * Usage: npx tsx src/whatsapp-auth.ts [--pairing-code]
  */
 import fs from 'fs';
+import path from 'path';
 import readline from 'readline';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
@@ -129,6 +130,13 @@ async function authenticate(): Promise<void> {
           console.log('  Your Pairing Code: ' + code);
           console.log('');
           console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+          try {
+            fs.writeFileSync(path.join(AUTH_DIR, 'last-pairing-code.txt'), code + '\n');
+            console.log(`Pairing code saved to: ${path.join(AUTH_DIR, 'last-pairing-code.txt')}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`Failed to write pairing code file: ${msg}`);
+          }
           console.log('Steps to link:');
           console.log('  1. Open WhatsApp on your phone');
           console.log('  2. Tap Settings > Linked Devices');
@@ -147,14 +155,27 @@ async function authenticate(): Promise<void> {
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr && !phoneNumber) {
-        console.log('Scan this QR code with WhatsApp:\n');
-        console.log('  1. Open WhatsApp on your phone');
-        console.log('  2. Tap Settings > Linked Devices > Link a Device');
-        console.log('  3. Point your camera at the QR code below\n');
-        qrcode.generate(qr, { small: true });
-        console.log('\n');
-      }
+    if (qr && !phoneNumber) {
+      console.log('Scan this QR code with WhatsApp:\n');
+      console.log('  1. Open WhatsApp on your phone');
+      console.log('  2. Tap Settings > Linked Devices > Link a Device');
+      console.log('  3. Point your camera at the QR code below\n');
+      qrcode.generate(qr, { small: true }, (qrText) => {
+        const qrPath = path.join(AUTH_DIR, 'last-qr.txt');
+        const rawPath = path.join(AUTH_DIR, 'last-qr.raw.txt');
+        try {
+          fs.writeFileSync(qrPath, qrText);
+          fs.writeFileSync(rawPath, qr + '\n');
+          console.log(`QR text saved to: ${qrPath}`);
+          console.log(`QR raw string saved to: ${rawPath}`);
+          console.log('Open the text file in a taller view if the terminal is clipped.');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Failed to write QR text file: ${msg}`);
+        }
+      });
+      console.log('\n');
+    }
 
       if (connection === 'close') {
         const reason = (lastDisconnect?.error as any)?.output?.statusCode;

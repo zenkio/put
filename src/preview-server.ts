@@ -3,7 +3,25 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-const PREVIEW_DIR = path.resolve(process.cwd(), 'data', 'preview');
+function resolveDefaultPreviewDir(): string {
+  if (process.env.PREVIEW_DIR) {
+    return path.resolve(process.env.PREVIEW_DIR);
+  }
+
+  const candidates = [
+    // Group-local preview directory (writable by non-main containers)
+    path.resolve(process.cwd(), 'groups', 'jambutter-project', '.data', 'preview'),
+    // Legacy global preview directory
+    path.resolve(process.cwd(), 'data', 'preview'),
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return candidates[0];
+}
+
+const PREVIEW_DIR = resolveDefaultPreviewDir();
 const ACTIVE_FILE = path.join(PREVIEW_DIR, '.active');
 const PORT = parseInt(process.env.PREVIEW_PORT || '8080', 10);
 

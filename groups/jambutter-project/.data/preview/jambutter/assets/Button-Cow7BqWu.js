@@ -1,0 +1,1 @@
+import{p as m}from"./chunk-EPOLDU6W-CZk9s2OB.js";function c({children:t,variant:s="primary",size:n="md",className:a="",...e}){const r={primary:"btn-primary",secondary:"btn-secondary",accent:"btn-accent"},p={sm:"px-4 py-2 text-sm",md:"px-6 py-3 text-base",lg:"px-8 py-4 text-lg"};return m.jsx("button",{className:`btn ${r[s]} ${p[n]} ${a}`,...e,children:t})}export{c as B};

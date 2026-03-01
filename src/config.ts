@@ -96,6 +96,33 @@ export const ROUTER_CONFIG = {
   complexityThreshold: 40,
 };
 
+// Shared memory / routing / task guardrails
+export const MEMORY_STORE = (process.env.MEMORY_STORE || 'sqlite').toLowerCase();
+export const MEMORY_MAX_RESULTS = parseInt(
+  process.env.MEMORY_MAX_RESULTS || '10',
+  10,
+);
+export const MEMORY_MAX_HISTORY_STEPS = parseInt(
+  process.env.MEMORY_MAX_HISTORY_STEPS || '6',
+  10,
+);
+export const TASK_MAX_FILES_PER_STEP = parseInt(
+  process.env.TASK_MAX_FILES_PER_STEP || '3',
+  10,
+);
+export const TASK_AUTORUN_COMMANDS =
+  (process.env.TASK_AUTORUN_COMMANDS || 'true').toLowerCase() !== 'false';
+export const ROUTING_ESCALATION_ORDER = (process.env.ROUTING_ESCALATION_ORDER ||
+  'local,gemini,openrouter,claude')
+  .split(',')
+  .map((s) => {
+    const v = s.trim().toLowerCase();
+    return v === 'phi3' ? 'local' : v;
+  })
+  .filter((s) => ['local', 'gemini', 'openrouter', 'claude'].includes(s)) as Array<
+  'local' | 'gemini' | 'openrouter' | 'claude'
+>;
+
 // Email Channel Configuration
 import type { EmailChannelConfig } from './types.js';
 export const EMAIL_CHANNEL: EmailChannelConfig = {

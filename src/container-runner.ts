@@ -39,7 +39,19 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  model?: 'claude' | 'gemini' | 'openrouter' | 'phi3';
+  model?: 'claude' | 'gemini' | 'openrouter' | 'local';
+  runId?: string;
+}
+
+export interface CommandCheckpoint {
+  runId: string;
+  provider: string;
+  tool: string;
+  command?: string;
+  exitCode: number;
+  stdoutSummary?: string;
+  stderrSummary?: string;
+  timestamp: string;
 }
 
 export interface ContainerOutput {
@@ -47,6 +59,9 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  modelUsed?: string;
+  provider?: string;
+  checkpoints?: CommandCheckpoint[];
 }
 
 interface VolumeMount {
@@ -145,7 +160,13 @@ function buildVolumeMounts(
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY'];
+    const allowedVars = [
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'ANTHROPIC_API_KEY',
+      'GEMINI_API_KEY',
+      'OPENROUTER_API_KEY',
+      'TASK_AUTORUN_COMMANDS',
+    ];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -189,7 +210,15 @@ function buildVolumeMounts(
 }
 
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--add-host=host.docker.internal:host-gateway'];
+  const args: string[] = [
+    'run',
+    '-i',
+    '--rm',
+    // Required for local Ollama fallback: many installs bind Ollama to 127.0.0.1 only.
+    // Host networking lets containerized agent reach host loopback on Linux.
+    '--network=host',
+    '--add-host=host.docker.internal:host-gateway',
+  ];
 
   // Apple Container: --mount for readonly, -v for read-write
   for (const mount of mounts) {
@@ -208,11 +237,49 @@ function buildContainerArgs(mounts: VolumeMount[]): string[] {
   return args;
 }
 
+function readAndConsumeCheckpoints(
+  groupFolder: string,
+  runId: string,
+): CommandCheckpoint[] {
+  const dir = path.join(DATA_DIR, 'ipc', groupFolder, 'checkpoints');
+  if (!fs.existsSync(dir)) return [];
+
+  const out: CommandCheckpoint[] = [];
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  for (const file of files) {
+    const full = path.join(dir, file);
+    try {
+      const raw = JSON.parse(fs.readFileSync(full, 'utf-8')) as Partial<CommandCheckpoint>;
+      if (raw.runId !== runId) continue;
+      out.push({
+        runId: String(raw.runId || runId),
+        provider: String(raw.provider || 'unknown'),
+        tool: String(raw.tool || 'unknown'),
+        command: raw.command ? String(raw.command) : undefined,
+        exitCode: Number(raw.exitCode ?? -1),
+        stdoutSummary: raw.stdoutSummary ? String(raw.stdoutSummary) : undefined,
+        stderrSummary: raw.stderrSummary ? String(raw.stderrSummary) : undefined,
+        timestamp: String(raw.timestamp || new Date().toISOString()),
+      });
+    } catch {
+      // ignore bad checkpoint files
+    } finally {
+      try {
+        fs.unlinkSync(full);
+      } catch {
+        // ignore cleanup failures
+      }
+    }
+  }
+  return out.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  const runId = input.runId || `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -254,7 +321,7 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
+    container.stdin.write(JSON.stringify({ ...input, runId }));
     container.stdin.end();
 
     container.stdout.on('data', (data) => {
@@ -300,6 +367,7 @@ export async function runContainerAgent(
         status: 'error',
         result: null,
         error: `Container timed out after ${CONTAINER_TIMEOUT}ms`,
+        checkpoints: readAndConsumeCheckpoints(group.folder, runId),
       });
     }, group.containerConfig?.timeout || CONTAINER_TIMEOUT);
 
@@ -361,6 +429,20 @@ export async function runContainerAgent(
 
         if (code !== 0) {
           logLines.push(
+            `=== Failure Diagnostics ===`,
+            `Captured stderr length: ${stderr.length} chars`,
+            `Captured stdout length: ${stdout.length} chars`,
+            ``,
+            `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
+            stderr,
+            ``,
+            `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
+            stdout,
+            ``,
+          );
+
+          // Keep a short tail section for quick scan.
+          logLines.push(
             `=== Stderr (last 500 chars) ===`,
             stderr.slice(-500),
             ``,
@@ -387,6 +469,7 @@ export async function runContainerAgent(
           status: 'error',
           result: null,
           error: `Container exited with code ${code}: ${stderr.slice(-200)}`,
+          checkpoints: readAndConsumeCheckpoints(group.folder, runId),
         });
         return;
       }
@@ -408,6 +491,7 @@ export async function runContainerAgent(
         }
 
         const output: ContainerOutput = JSON.parse(jsonLine);
+        output.checkpoints = readAndConsumeCheckpoints(group.folder, runId);
 
         logger.info(
           {
@@ -434,6 +518,7 @@ export async function runContainerAgent(
           status: 'error',
           result: null,
           error: `Failed to parse container output: ${err instanceof Error ? err.message : String(err)}`,
+          checkpoints: readAndConsumeCheckpoints(group.folder, runId),
         });
       }
     });
@@ -445,6 +530,7 @@ export async function runContainerAgent(
         status: 'error',
         result: null,
         error: `Container spawn error: ${err.message}`,
+        checkpoints: readAndConsumeCheckpoints(group.folder, runId),
       });
     });
   });

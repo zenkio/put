@@ -181,13 +181,17 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
 // Container configuration
 export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '300000', 10);
+export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10);
 export const IPC_POLL_INTERVAL = 1000;
 
 export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
 ```
 
 **Note:** Paths must be absolute for Apple Container volume mounts to work correctly.
+
+### Timeout Tuning
+
+Keep `containerConfig.timeout` (or `CONTAINER_TIMEOUT`) higher than any provider-specific hard timeout used in your fallback chain, and run `npm run refresh` after changing container-side timeout logic.
 
 ### Container Configuration
 

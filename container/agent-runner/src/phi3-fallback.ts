@@ -1,18 +1,93 @@
 /**
- * Phi3 Fallback Agent for NanoClaw
- * Uses phi3:mini via Ollama as a tool-use agent.
- * Provides the same tools as the Claude/Gemini agents, plus delegation tools.
+ * Local LLM fallback agent for NanoClaw (Ollama).
+ * Uses LOCAL_FALLBACK_MODEL (default qwen2.5-coder:3b).
+ * It acts as a text generator and signals escalation via natural language.
+ * It does not directly use tools, but its system prompt guides it to request escalation.
  */
 
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import {
+  appendSharedContextRecord,
+  buildSharedContextPrompt,
+} from './context-store.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const MAX_ITERATIONS = 10;
-const OLLAMA_URL = 'http://host.docker.internal:11434/api/chat';
+function envNum(primary: string, legacy: string, fallback: number): number {
+  const v = process.env[primary] ?? process.env[legacy];
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const DEFAULT_LOCAL_FALLBACK_MODEL =
+  process.env.LOCAL_FALLBACK_MODEL || process.env.PHI3_MODEL || 'qwen2.5-coder:3b';
+const OLLAMA_STREAM_IDLE_TIMEOUT_MS = envNum('LOCAL_FALLBACK_IDLE_TIMEOUT_MS', 'PHI3_IDLE_TIMEOUT_MS', 120000);
+const OLLAMA_REQUEST_HARD_TIMEOUT_MS = envNum('LOCAL_FALLBACK_HARD_TIMEOUT_MS', 'PHI3_HARD_TIMEOUT_MS', 420000);
+const OLLAMA_HEALTHCHECK_TIMEOUT_MS = 2500;
+const LOCAL_PROGRESS_LOG_INTERVAL_MS = 3000;
+const LOCAL_PROGRESS_LOG_CHAR_STEP = 300;
+const LOCAL_NUM_THREAD = envNum('LOCAL_FALLBACK_NUM_THREAD', 'PHI3_NUM_THREAD', 2);
+const LOCAL_NUM_PREDICT = envNum('LOCAL_FALLBACK_NUM_PREDICT', 'PHI3_NUM_PREDICT', 192);
+const LOCAL_NUM_CTX = envNum('LOCAL_FALLBACK_NUM_CTX', 'PHI3_NUM_CTX', 768);
+const LOCAL_TEMPERATURE = envNum('LOCAL_FALLBACK_TEMPERATURE', 'PHI3_TEMPERATURE', 0.2);
+const LOCAL_MAX_INPUT_CHARS = envNum('LOCAL_FALLBACK_MAX_INPUT_CHARS', 'PHI3_MAX_INPUT_CHARS', 5000);
+const LOCAL_MAX_SYSTEM_PROMPT_CHARS = envNum(
+  'LOCAL_FALLBACK_MAX_SYSTEM_PROMPT_CHARS',
+  'PHI3_MAX_SYSTEM_PROMPT_CHARS',
+  3500,
+);
+
+function normalizeOllamaChatUrl(url: string): string {
+  return url.replace('http://localhost:11434', 'http://127.0.0.1:11434');
+}
+
+function getOllamaUrls(): string[] {
+  // Keep multiple endpoints but de-duplicate localhost/127.0.0.1 aliases.
+  const urls = [
+    'http://127.0.0.1:11434/api/chat',
+    'http://host.docker.internal:11434/api/chat',
+    'http://localhost:11434/api/chat',
+  ];
+  return [...new Set(urls.map(normalizeOllamaChatUrl))];
+}
+
+async function filterReachableOllamaUrls(urls: string[]): Promise<string[]> {
+  const attempted: string[] = [];
+  for (const chatUrl of urls) {
+    const baseUrl = chatUrl.replace('/api/chat', '/api/tags');
+    attempted.push(baseUrl);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      OLLAMA_HEALTHCHECK_TIMEOUT_MS,
+    );
+    try {
+      const res = await fetch(baseUrl, {
+        method: 'GET',
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        // Use the first healthy endpoint only to reduce extra retries/startup delay.
+        return [chatUrl];
+      } else {
+        log(`Ollama healthcheck failed at ${baseUrl}: HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      const msg =
+        err?.name === 'AbortError'
+          ? `timeout after ${OLLAMA_HEALTHCHECK_TIMEOUT_MS}ms`
+          : err?.message || String(err);
+      log(`Ollama healthcheck failed at ${baseUrl}: ${msg}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  log(`No reachable Ollama endpoint. Tried: ${attempted.join(', ')}`);
+  return [];
+}
 
 interface Phi3Input {
   prompt: string;
@@ -20,16 +95,57 @@ interface Phi3Input {
   groupFolder: string;
   isMain: boolean;
   model?: string;
+  runId?: string;
 }
 
 interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
   error?: string;
+  modelUsed?: string;
+  provider?: string;
 }
 
 function log(message: string): void {
-  console.error(`[phi3-fallback] ${message}`);
+  console.error(`[local-fallback] ${message}`);
+}
+
+function decodeXmlEntities(input: string): string {
+  return input
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&');
+}
+
+function sanitizePhi3WhatsappText(input: string): string {
+  let text = (input || '').trim();
+  if (!text) return text;
+
+  // Remove fenced wrapper when model echoes XML examples in code blocks.
+  text = text.replace(/^```(?:xml)?\s*/i, '').replace(/\s*```$/i, '').trim();
+
+  // If the model mirrors our internal XML transcript format, keep only message body.
+  const messageBody = text.match(/<message\b[^>]*>([\s\S]*?)<\/message>/i);
+  if (messageBody?.[1]) {
+    text = messageBody[1].trim();
+  } else {
+    text = text.replace(/<\/?messages\b[^>]*>/gi, '');
+    text = text.replace(/<\/?message\b[^>]*>/gi, '');
+  }
+
+  // Strip accidental source tags generated by the model itself.
+  text = text.replace(/\[source:\s*[^\]]+\]\s*$/i, '').trim();
+  return decodeXmlEntities(text).trim();
+}
+
+function recordPhi3Context(input: Phi3Input, result: string | null): void {
+  appendSharedContextRecord({
+    source: input.model || DEFAULT_LOCAL_FALLBACK_MODEL,
+    prompt: input.prompt,
+    result: result || '',
+    group: input.groupFolder,
+  });
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -48,21 +164,26 @@ function loadSystemPrompt(isDirect: boolean): string {
   if (isDirect) {
     parts.push(
       '## PRIMARY MODE — You are the main assistant (Phi3)',
-      'You are responding directly to a WhatsApp conversation. The user is talking to you.',
-      'Be helpful, conversational, and complete.',
+      'You are responding directly to a WhatsApp conversation.',
       '',
-      'You have tools: bash, read_file, write_file, list_files, send_message, schedule_task, delegate_to_claude, delegate_to_gemini, delegate_to_openrouter.',
-      'Work directory: /workspace/group/',
+      'CRITICAL INSTRUCTION: You DO NOT have access to external tools (like bash, file operations, or web searches). ',
+      'If the user asks for *ANYTHING* that requires a tool, or for complex tasks (e.g., deep coding, detailed architecture, current events, web search, reading/writing files, running commands), you MUST stop immediately and respond *ONLY* with the exact phrase: `ESCALATE_TO_PREMIUM: [brief reason for escalation]`',
       '',
-      '- If a task is complex (coding, deep analysis), use delegate_to_claude.',
-      '- If you need to search the web or do large-scale processing, use delegate_to_gemini.',
-      '- Use send_message to keep the user informed.',
+      'DO NOT provide alternative answers or advice. Your only response to such requests is the escalation signal.',
+      '',
+      'Example: `ESCALATE_TO_PREMIUM: Cannot list files; requires file system access.`',
+      '',
+      'Output format: plain WhatsApp text only. Never output XML/HTML tags like <messages> or <message>.'
     );
   } else {
     parts.push(
       '## WORKER MODE',
-      'You are a Phi3 worker. Execute the task in the user prompt.',
-      'Keep responses concise.',
+      'You are a Phi3 worker.',
+      'CRITICAL INSTRUCTION: You have NO TOOLS. If the task requires tools or is too complex for a simple text response, you MUST stop immediately and respond *ONLY* with the exact phrase: `ESCALATE_TO_PREMIUM: [brief reason for escalation]`',
+      '',
+      'DO NOT provide alternative answers or advice. Your only response to such requests is the escalation signal.',
+      '',
+      'Output format: plain text only. Never output XML/HTML tags like <messages> or <message>.',
     );
   }
 
@@ -77,241 +198,280 @@ function loadSystemPrompt(isDirect: boolean): string {
     parts.push(fs.readFileSync(groupPath, 'utf-8'));
   }
 
-  return parts.join('\\n\\n');
+  const sharedContext = buildSharedContextPrompt();
+  if (sharedContext) {
+    parts.push(sharedContext);
+  }
+
+  const combined = parts.join('\n\n');
+  if (combined.length <= LOCAL_MAX_SYSTEM_PROMPT_CHARS) return combined;
+  return (
+    combined.slice(0, LOCAL_MAX_SYSTEM_PROMPT_CHARS) +
+    '\n\n[System prompt truncated for low-memory local fallback mode]'
+  );
 }
 
-const toolDefinitions = [
-  {
-    type: 'function',
-    function: {
-      name: 'bash',
-      description: 'Execute a bash command and return its output.',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: 'The bash command to execute' },
-        },
-        required: ['command'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'read_file',
-      description: 'Read the contents of a file.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute path to the file' },
-        },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'write_file',
-      description: 'Write content to a file.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute path to the file' },
-          content: { type: 'string', description: 'Content to write' },
-        },
-        required: ['path', 'content'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_files',
-      description: 'List files in a directory.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Directory path to list' },
-          recursive: { type: 'boolean' },
-        },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_message',
-      description: 'Send a message to the current WhatsApp chat.',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: 'Message text to send' },
-        },
-        required: ['text'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'delegate_to_claude',
-      description: 'Delegate a complex task to Claude.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The task for Claude' },
-        },
-        required: ['prompt'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'delegate_to_gemini',
-      description: 'Delegate a task to Gemini (good for web search, large context).',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The task for Gemini' },
-        },
-        required: ['prompt'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'delegate_to_openrouter',
-      description: 'Delegate a task to OpenRouter (alternative fallback).',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The task for OpenRouter' },
-        },
-        required: ['prompt'],
-      },
-    },
-  }
-];
+// Local fallback models in this path do not use native tool-calling here.
+// We will rely on natural language for escalation signals.
 
 async function executeTool(
   name: string,
   args: any,
   ctx: { chatJid: string; groupFolder: string; isMain: boolean }
 ): Promise<string> {
-  try {
-    switch (name) {
-      case 'bash':
-        return execSync(args.command, { cwd: '/workspace/group', encoding: 'utf-8' }) || '(no output)';
-      case 'read_file':
-        return fs.readFileSync(args.path, 'utf-8');
-      case 'write_file':
-        fs.mkdirSync(path.dirname(args.path), { recursive: true });
-        fs.writeFileSync(args.path, args.content);
-        return `Written to ${args.path}`;
-      case 'list_files':
-        return fs.readdirSync(args.path).join('\\n') || '(empty)';
-      case 'send_message':
-        writeIpcFile(MESSAGES_DIR, {
-          type: 'message',
-          chatJid: ctx.chatJid,
-          text: args.text,
-          groupFolder: ctx.groupFolder,
-          timestamp: new Date().toISOString(),
-        });
-        return 'Message queued.';
-      case 'escalate_to_premium':
-        // Return a special marker that the host will recognize
-        return 'SIGNAL: ESCALATE_TO_PREMIUM. Reason: ' + (args.reason || 'Task too complex for local AI');
-      default:
-        return `Unknown tool: ${name}`;
-    }
-  } catch (err: any) {
-    return `Error: ${err.message}`;
-  }
+  log(`WARNING: Local model attempted tool call: ${name}, which is not supported here.`);
+  return `Error: Local model should not be calling tools directly. Use ESCALATE_TO_PREMIUM.`;
 }
 
 export async function runPhi3Fallback(input: Phi3Input): Promise<ContainerOutput> {
-  const model = input.model || 'phi3:mini';
+  const model = input.model || DEFAULT_LOCAL_FALLBACK_MODEL;
   const isDirect = input.prompt.includes('<messages>');
-  const systemPrompt = loadSystemPrompt(isDirect) + '\n\nIMPORTANT: If you encounter a task that requires advanced coding, deep reasoning, or complex creative writing beyond your capabilities, use the escalate_to_premium tool immediately.';
+  const systemPrompt = loadSystemPrompt(isDirect);
+  const ollamaUrls = await filterReachableOllamaUrls(getOllamaUrls());
+  if (ollamaUrls.length === 0) {
+    return {
+      status: 'error',
+      result: null,
+      error: 'Ollama is not reachable on any local endpoint',
+    };
+  }
   
+  const trimmedUserPrompt =
+    input.prompt.length > LOCAL_MAX_INPUT_CHARS
+      ? `[Prompt truncated to last ${LOCAL_MAX_INPUT_CHARS} chars for low-memory local fallback mode]\n` +
+        input.prompt.slice(-LOCAL_MAX_INPUT_CHARS)
+      : input.prompt;
+
   const messages: any[] = [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: input.prompt }
+    { role: 'user', content: trimmedUserPrompt }
   ];
 
   const ctx = { chatJid: input.chatJid, groupFolder: input.groupFolder, isMain: input.isMain };
 
-  log(`Starting Phi3 agent loop (model: ${model}, threads: 2, limit: 500)`);
+  log(
+    `Starting local fallback loop (model: ${model}, threads: ${LOCAL_NUM_THREAD}, limit: ${LOCAL_NUM_PREDICT}, ctx: ${LOCAL_NUM_CTX})`,
+  );
 
   for (let i = 0; i < MAX_ITERATIONS; i++) {
-    try {
-      const response = await fetch(OLLAMA_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages,
-          tools: [
-            ...toolDefinitions.filter(t => !['delegate_to_claude', 'delegate_to_gemini', 'delegate_to_openrouter'].includes(t.function.name)),
-            {
-              type: 'function',
-              function: {
-                name: 'escalate_to_premium',
-                description: 'Call this if the task is too complex for you to handle safely or accurately.',
-                parameters: {
-                  type: 'object',
-                  properties: { reason: { type: 'string' } }
-                }
-              }
-            }
-          ],
-          options: {
-            num_thread: 2,
-            num_predict: 500,
-            temperature: 0.7
-          },
-          stream: false
-        })
-      });
+    let message: { content?: string; tool_calls?: any[] } | null = null;
+    let endpointUsed = '';
+    let lastNetworkError = '';
+    for (const url of ollamaUrls) {
+      endpointUsed = url;
+      let timedOutByIdle = false;
+      let timedOutByHardLimit = false;
+      try {
+        const controller = new AbortController();
+        const hardTimeout = setTimeout(() => {
+          timedOutByHardLimit = true;
+          controller.abort();
+        }, OLLAMA_REQUEST_HARD_TIMEOUT_MS);
+        try {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model,
+              messages,
+              // Tools are omitted; local fallback relies on natural-language escalation.
+              options: {
+                num_thread: LOCAL_NUM_THREAD,
+                num_predict: LOCAL_NUM_PREDICT,
+                num_ctx: LOCAL_NUM_CTX,
+                temperature: LOCAL_TEMPERATURE
+              },
+              stream: true
+            }),
+            signal: controller.signal,
+          });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        return { status: 'error', result: null, error: `Ollama error: ${response.status} ${errorText}` };
-      }
-
-      const data: any = await response.json();
-      const message = data.message;
-      messages.push(message);
-
-      if (message.tool_calls && message.tool_calls.length > 0) {
-        for (const toolCall of message.tool_calls) {
-          log(`Tool call: ${toolCall.function.name}`);
-          const result = await executeTool(toolCall.function.name, toolCall.function.arguments, ctx);
-          
-          if (result.startsWith('SIGNAL: ESCALATE_TO_PREMIUM')) {
-             return { status: 'success', result: 'ESCALATE_TO_PREMIUM: ' + result };
+          if (!response.ok) {
+            const errorText = await response.text();
+            return {
+              status: 'error',
+              result: null,
+              error: `Ollama error at ${endpointUsed}: ${response.status} ${errorText}`,
+            };
           }
 
-          messages.push({
-            role: 'tool',
-            content: result,
-            tool_call_id: toolCall.id
-          });
+          if (!response.body) {
+            throw new Error('Empty response body from Ollama stream');
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let aggregatedContent = '';
+          let latestToolCalls: any[] = [];
+          let lastStreamActivityMs = Date.now();
+          let lastProgressLogMs = Date.now();
+          let charsSinceLastProgressLog = 0;
+          const streamStartedAt = Date.now();
+
+          const idleGuard = setInterval(() => {
+            if (Date.now() - lastStreamActivityMs > OLLAMA_STREAM_IDLE_TIMEOUT_MS) {
+              timedOutByIdle = true;
+              controller.abort();
+            }
+          }, 1000);
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              if (!value || value.length === 0) continue;
+              lastStreamActivityMs = Date.now();
+              buffer += decoder.decode(value, { stream: true });
+
+              let newlineIndex = buffer.indexOf('\n');
+              while (newlineIndex >= 0) {
+                const line = buffer.slice(0, newlineIndex).trim();
+                buffer = buffer.slice(newlineIndex + 1);
+
+                if (line) {
+                  try {
+                    const chunk = JSON.parse(line) as {
+                      message?: { content?: string; tool_calls?: any[] };
+                    };
+                    const chunkMessage = chunk.message;
+                    if (chunkMessage?.content) {
+                      aggregatedContent += chunkMessage.content;
+                      charsSinceLastProgressLog += chunkMessage.content.length;
+                      const now = Date.now();
+                      if (
+                        now - lastProgressLogMs >= LOCAL_PROGRESS_LOG_INTERVAL_MS ||
+                        charsSinceLastProgressLog >= LOCAL_PROGRESS_LOG_CHAR_STEP
+                      ) {
+                        log(
+                          `Local stream progress (${endpointUsed}): ${aggregatedContent.length} chars in ${now - streamStartedAt}ms`,
+                        );
+                        lastProgressLogMs = now;
+                        charsSinceLastProgressLog = 0;
+                      }
+                    }
+                    if (Array.isArray(chunkMessage?.tool_calls)) {
+                      latestToolCalls = chunkMessage.tool_calls;
+                    }
+                  } catch {
+                    // Ignore non-JSON or partial lines from the stream.
+                  }
+                }
+
+                newlineIndex = buffer.indexOf('\n');
+              }
+            }
+          } finally {
+            clearInterval(idleGuard);
+          }
+
+          const trailing = buffer.trim();
+          if (trailing) {
+            try {
+              const chunk = JSON.parse(trailing) as {
+                message?: { content?: string; tool_calls?: any[] };
+              };
+              if (chunk.message?.content) {
+                aggregatedContent += chunk.message.content;
+              }
+              if (Array.isArray(chunk.message?.tool_calls)) {
+                latestToolCalls = chunk.message.tool_calls;
+              }
+            } catch {
+              // Ignore trailing parse failures.
+            }
+          }
+
+          log(
+            `Local stream completed (${endpointUsed}): ${aggregatedContent.length} chars in ${Date.now() - streamStartedAt}ms`,
+          );
+          message = { content: aggregatedContent, tool_calls: latestToolCalls };
+        } finally {
+          clearTimeout(hardTimeout);
         }
-        continue;
+
+        if (!message) {
+          throw new Error('No message content produced by Ollama stream');
+        }
+
+        break;
+      } catch (err: any) {
+        if (timedOutByIdle) {
+          const msg = `idle timeout after ${OLLAMA_STREAM_IDLE_TIMEOUT_MS}ms with no stream output`;
+          lastNetworkError = `${url}: ${msg}`;
+          log(`Local fallback API error at ${url}: ${msg}`);
+          continue;
+        }
+        if (timedOutByHardLimit) {
+          const msg = `hard timeout after ${OLLAMA_REQUEST_HARD_TIMEOUT_MS}ms`;
+          lastNetworkError = `${url}: ${msg}`;
+          log(`Local fallback API error at ${url}: ${msg}`);
+          continue;
+        }
+        const msg =
+          err?.name === 'AbortError'
+            ? `request aborted`
+            : err?.message || String(err);
+        lastNetworkError = `${url}: ${msg}`;
+        log(`Local fallback API error at ${url}: ${msg}`);
+      }
+    }
+
+    try {
+      if (!message) {
+        return {
+          status: 'error',
+          result: null,
+          error: `Ollama unreachable: ${lastNetworkError || 'all endpoints failed'}`,
+        };
+      }
+      messages.push(message);
+
+      // Check for escalation signal in natural language (case-insensitive and very flexible)
+      const rawContent = message.content || '';
+      const content = sanitizePhi3WhatsappText(rawContent);
+      const upperContent = content.toUpperCase();
+      const needsEscalation = 
+          upperContent.includes('ESCALATE_TO') || 
+          upperContent.includes('ESCALATE_TO_PREMIUM') || 
+          upperContent.includes('ESCALATE_TO_WORKER') ||
+          (upperContent.includes('ESCALATE') && (upperContent.includes('PREMIUM') || upperContent.includes('TOOL') || upperContent.includes('COMMAND'))) ||
+          // Heuristics for a model admitting it cannot do something it was asked
+          (upperContent.includes('I CANNOT') && (upperContent.includes('BROWSE') || upperContent.includes('INTERNET') || upperContent.includes('FILES') || upperContent.includes('COMMAND'))) ||
+          (upperContent.includes('I\'M SORRY') && upperContent.includes('CANNOT ASSIST'));
+
+      if (needsEscalation) {
+         log('Escalation signal (or heuristic) detected in response.');
+         recordPhi3Context(input, rawContent);
+         return {
+           status: 'success',
+           result: `ESCALATE_TO_PREMIUM: Model suggested it cannot perform the task. Original response: ${content}`,
+           modelUsed: model,
+           provider: 'local',
+         };
       }
 
-      return { status: 'success', result: message.content };
+      // Some local models may hallucinate tool calls.
+      // If it hallucinates tool calls, we log a warning and pass the response back.
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        log(`WARNING: Local model hallucinated a tool call: ${message.tool_calls[0].function.name}`);
+        recordPhi3Context(input, 'Local model hallucinated tool use');
+        return {
+          status: 'success',
+          result: `ERROR: Local model attempted unsupported tool use. Please refine your prompt or escalate.`,
+          modelUsed: model,
+          provider: 'local',
+        };
+      }
+
+      recordPhi3Context(input, rawContent);
+      return { status: 'success', result: content, modelUsed: model, provider: 'local' };
     } catch (err: any) {
-      log(`Phi3 API error: ${err.message}`);
+      log(`Local fallback API error: ${err.message}`);
       return { status: 'error', result: null, error: err.message };
     }
   }
 
-  return { status: 'error', result: null, error: 'Phi3 agent reached max iterations' };
+  return { status: 'error', result: null, error: 'Local fallback agent reached max iterations' };
 }

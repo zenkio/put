@@ -21,3 +21,9 @@ logs/
 .vscode/
 
 agents-sdk-docs
+
+# Local Netlify folder
+.netlify
+
+# Runtime conversation transcripts (may contain secrets)
+groups/*/conversations/

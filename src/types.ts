@@ -86,3 +86,47 @@ export interface EmailChannelConfig {
   pollIntervalMs: number;
   replyPrefix?: string;  // Optional prefix for replies
 }
+
+export interface AutonomousTask {
+  id: string;
+  group_folder: string;
+  chat_jid: string;
+  project_name: string | null;
+  title: string;
+  original_prompt: string;
+  status: 'queued' | 'active' | 'completed' | 'failed' | 'paused';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AutonomousStep {
+  id: string;
+  task_id: string;
+  parent_step_id: string | null;
+  step_type: 'plan' | 'execute';
+  step_order: number;
+  title: string;
+  instructions: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'failed' | 'blocked';
+  attempt_count: number;
+  requires_verification: number;
+  verified_by: 'phi3' | 'claude' | 'gemini' | 'openrouter' | null;
+  verification_status: 'pending' | 'confirmed' | 'rejected' | 'not_required';
+  result_summary: string | null;
+  error: string | null;
+  next_retry_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AutonomousDecisionLog {
+  id: string;
+  task_id: string;
+  step_id: string;
+  decision: string;
+  confidence: 'low' | 'medium' | 'high';
+  requires_verification: number;
+  verified_by: 'phi3' | 'claude' | 'gemini' | 'openrouter';
+  verification_status: 'pending' | 'confirmed' | 'rejected';
+  created_at: string;
+}

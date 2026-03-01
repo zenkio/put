@@ -110,6 +110,18 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Bash access is safe because commands run inside the container, not on the host
 - Browser automation via agent-browser with Chromium in the container
 
+### Timeout Tuning (Quick Ops)
+
+| Layer | Scope | Current Pattern | Tuning Guidance |
+|---|---|---|---|
+| `containerConfig.timeout` | Per group (`data/registered_groups.json`) | Host kill limit for each container run | Set this above the longest provider hard timeout in the fallback chain |
+| `CONTAINER_TIMEOUT` | Global fallback (`src/config.ts`) | Default host kill limit when group override is absent | Keep as safety net; use per-group override for heavy projects |
+| Provider request idle timeout | Inside provider fallback worker | Fails stalled streams/requests with no progress | Increase only if model is slow but still healthy |
+| Provider request hard timeout | Inside provider fallback worker | Hard cap per request | Keep bounded to avoid hung runs |
+| Provider session hard timeout | Inside provider fallback worker | Hard cap across retries/tool cycles | Must stay below group/container timeout |
+
+Operational note: after changing container-side timeout logic, run `npm run refresh` so rebuilt agent code is active.
+
 ### Scheduled Tasks
 - Users can ask Claude to schedule recurring or one-time tasks from any group
 - Tasks run as full agents in the context of the group that created them

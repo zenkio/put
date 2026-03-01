@@ -1,0 +1,156 @@
+/**
+ * Phi3 Fallback Agent for NanoClaw
+ * Uses phi3:mini via Ollama. It acts as a text generator and signals escalation via natural language.
+ * It does not directly use tools, but its system prompt guides it to request escalation.
+ */
+
+import fs from 'fs';
+import path from 'path';
+
+const IPC_DIR = '/workspace/ipc';
+const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
+const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const MAX_ITERATIONS = 10;
+const OLLAMA_URL = process.env.DOCKER_CONTAINER ? 'http://host.docker.internal:11434/api/chat' : 'http://localhost:11434/api/chat';
+
+interface Phi3Input {
+  prompt: string;
+  chatJid: string;
+  groupFolder: string;
+  isMain: boolean;
+  model?: string;
+}
+
+interface ContainerOutput {
+  status: 'success' | 'error';
+  result: string | null;
+  error?: string;
+}
+
+function log(message: string): void {
+  console.error(`[phi3-fallback] ${message}`);
+}
+
+function writeIpcFile(dir: string, data: object): string {
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const filepath = path.join(dir, filename);
+  const tempPath = `${filepath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tempPath, filepath);
+  return filename;
+}
+
+function loadSystemPrompt(isDirect: boolean): string {
+  const parts: string[] = [];
+
+  if (isDirect) {
+    parts.push(
+      '## PRIMARY MODE — You are the main assistant (Phi3)',
+      'You are responding directly to a WhatsApp conversation. The user is talking to you.',
+      'Be helpful, conversational, and complete.',
+      '',
+      'Your primary function is to provide direct text responses. If a task requires external tools (like reading/writing files, executing shell commands, or web searches), or if the task is complex and requires deep reasoning or code generation, you must output a special signal to escalate the task.',
+      '',
+      'To signal for escalation, you MUST output the exact phrase: `ESCALATE_TO_PREMIUM: [Reason for escalation]`',
+      '',
+      'Example escalation: `ESCALATE_TO_PREMIUM: Need to search the web for current events.`',
+      'Example escalation: `ESCALATE_TO_PREMIUM: This coding task requires advanced analysis.`'
+    );
+  } else {
+    parts.push(
+      '## WORKER MODE',
+      'You are a Phi3 worker. Your task is to process the user prompt.',
+      'You do not have direct access to external tools. If the task requires tools or is too complex for you to answer accurately with a simple text response, you must output a special signal to escalate.',
+      '',
+      'To signal for escalation, you MUST output the exact phrase: `ESCALATE_TO_PREMIUM: [Reason for escalation]`',
+    );
+  }
+
+  // Load group context
+  const globalPath = '/workspace/global/CLAUDE.md';
+  if (fs.existsSync(globalPath)) {
+    parts.push(fs.readFileSync(globalPath, 'utf-8'));
+  }
+
+  const groupPath = '/workspace/group/CLAUDE.md';
+  if (fs.existsSync(groupPath)) {
+    parts.push(fs.readFileSync(groupPath, 'utf-8'));
+  }
+
+  return parts.join('
+
+');
+}
+
+async function executeTool(
+  name: string,
+  args: any,
+  ctx: { chatJid: string; groupFolder: string; isMain: boolean }
+): Promise<string> {
+  log(`WARNING: Phi-3 attempted to use tool: ${name}, which is not directly supported or required.`);
+  return `Error: Phi-3 should not be calling tools directly. Use ESCALATE_TO_PREMIUM.`;
+}
+
+export async function runPhi3Fallback(input: Phi3Input): Promise<ContainerOutput> {
+  const model = input.model || 'phi3:mini';
+  const isDirect = input.prompt.includes('<messages>');
+  const systemPrompt = loadSystemPrompt(isDirect);
+  
+  const messages: any[] = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: input.prompt }
+  ];
+
+  const ctx = { chatJid: input.chatJid, groupFolder: input.groupFolder, isMain: input.isMain };
+
+  log(`Starting Phi3 agent loop (model: ${model}, threads: 2, limit: 500)`);
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    try {
+      const response = await fetch(OLLAMA_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages,
+          // Tools are omitted as Phi-3 relies on natural language for escalation.
+          options: {
+            num_thread: 2,
+            num_predict: 500,
+            temperature: 0.7
+          },
+          stream: false
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return { status: 'error', result: null, error: `Ollama error: ${response.status} ${errorText}` };
+      }
+
+      const data: any = await response.json();
+      const message = data.message;
+      messages.push(message);
+
+      // Check for escalation signal in natural language
+      if (message.content && message.content.includes('ESCALATE_TO_PREMIUM:')) {
+         return { status: 'success', result: message.content }; // Pass the signal back to the host
+      }
+
+      // Phi-3 Mini does not natively support tool calls in this manner. 
+      // If it hallucinates tool calls, we log a warning and pass the response back.
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        log(`WARNING: Phi-3 hallucinated a tool call: ${message.tool_calls[0].function.name}`);
+        return { status: 'success', result: `ERROR: Phi-3 attempted unsupported tool use. Please refine your prompt or escalate.` };
+      }
+
+      return { status: 'success', result: message.content };
+    } catch (err: any) {
+      log(`Phi3 API error: ${err.message}`);
+      return { status: 'error', result: null, error: err.message };
+    }
+  }
+
+  return { status: 'error', result: null, error: 'Phi3 agent reached max iterations' };
+}

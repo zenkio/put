@@ -1,0 +1,45 @@
+{
+  "openrouter": {
+    "status": "ok",
+    "model": "stepfun/step-3.5-flash:free",
+    "updated_at": "2026-02-20T14:41:54.939Z",
+    "last_success": "2026-02-20T14:41:54.939Z"
+  },
+  "gemini": {
+    "status": "error",
+    "error": "Max iterations reached",
+    "updated_at": "2026-02-27T03:13:19.634Z"
+  },
+  "gemini_models": {
+    "gemini-3-pro-preview": {
+      "status": "rate_limited",
+      "error": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-lim",
+      "updated_at": "2026-02-27T03:13:19.634Z",
+      "retry_after": "2026-02-27T03:13:59.763Z"
+    },
+    "gemini-3-flash-preview": {
+      "status": "rate_limited",
+      "error": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-lim",
+      "updated_at": "2026-02-27T03:13:19.330Z",
+      "retry_after": "2026-02-27T03:13:59.776Z"
+    },
+    "gemini-2.5-pro": {
+      "status": "rate_limited",
+      "error": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-lim",
+      "updated_at": "2026-02-27T03:13:19.572Z",
+      "retry_after": "2026-02-27T03:13:59.759Z"
+    },
+    "gemini-2.5-flash": {
+      "status": "rate_limited",
+      "error": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-lim",
+      "updated_at": "2026-02-27T03:13:19.512Z",
+      "retry_after": "2026-02-27T03:13:59.767Z"
+    },
+    "gemini-2.5-flash-lite": {
+      "status": "error",
+      "error": "{\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}}",
+      "updated_at": "2026-02-27T03:05:45.252Z",
+      "cooldown_until": "2026-02-27T04:05:45.252Z"
+    }
+  }
+}

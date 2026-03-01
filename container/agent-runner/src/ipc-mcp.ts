@@ -17,6 +17,7 @@ export interface IpcMcpContext {
   chatJid: string;
   groupFolder: string;
   isMain: boolean;
+  sourceTag?: string;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -34,7 +35,7 @@ function writeIpcFile(dir: string, data: object): string {
 }
 
 export function createIpcMcp(ctx: IpcMcpContext) {
-  const { chatJid, groupFolder, isMain } = ctx;
+  const { chatJid, groupFolder, isMain, sourceTag } = ctx;
 
   return createSdkMcpServer({
     name: 'nanoclaw',
@@ -51,6 +52,7 @@ export function createIpcMcp(ctx: IpcMcpContext) {
             type: 'message',
             chatJid,
             text: args.text,
+            source: sourceTag || 'claude',
             groupFolder,
             timestamp: new Date().toISOString()
           };

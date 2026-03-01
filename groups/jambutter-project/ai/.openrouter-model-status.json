@@ -1,0 +1,13 @@
+{
+  "mistralai/mistral-small-3.1-24b-instruct:free": {
+    "status": "rate_limited",
+    "error": "{\"error\":{\"message\":\"Provider returned error\",\"code\":429,\"metadata\":{\"raw\":\"mistralai/mistral-small-3.1-24b-instruct:free is temporarily rate-limited upstream. Please retry shortly, or add your own ke",
+    "updated_at": "2026-02-21T07:05:00.889Z",
+    "retry_after": "2026-02-21T07:06:00.889Z"
+  },
+  "stepfun/step-3.5-flash:free": {
+    "status": "ok",
+    "updated_at": "2026-02-21T06:45:18.683Z",
+    "last_success": "2026-02-21T06:45:18.683Z"
+  }
+}

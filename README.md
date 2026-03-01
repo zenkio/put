@@ -123,6 +123,36 @@ Key files:
 - `src/db.ts` - SQLite operations
 - `groups/*/CLAUDE.md` - Per-group memory
 
+## Shared Memory & Checkpoints
+
+NanoClaw now keeps provider-independent project memory in SQLite (`project_memory`), keyed by:
+- `channel`
+- `chat_jid`
+- `project_id`
+
+For each routed model call, NanoClaw injects a compact state bundle:
+- `SYSTEM`
+- `PROJECT_STATE`
+- `LAST_RESULT`
+- `CURRENT_TASK`
+
+This makes local and cloud models share continuity without relying on provider-side chat memory.
+
+Execution checkpoints are captured from tool runs (command, exit code, stdout/stderr summary, timestamps) and persisted into memory. Use:
+- `/memory status` to inspect the latest checkpoint summary.
+
+Progress-type queries (status/what's next/progress) are answered from memory directly to avoid premium quota usage where possible.
+
+## Runtime Config
+
+Environment variables:
+- `MEMORY_STORE` (`sqlite` default)
+- `MEMORY_MAX_RESULTS` (default `10`)
+- `MEMORY_MAX_HISTORY_STEPS` (default `6`)
+- `ROUTING_ESCALATION_ORDER` (comma-separated, default `phi3,gemini,openrouter,claude`)
+- `TASK_MAX_FILES_PER_STEP` (default `3`)
+- `TASK_AUTORUN_COMMANDS` (`true` default, set `false` to block tool `bash` execution)
+
 ## FAQ
 
 **Why WhatsApp and not Telegram/Signal/etc?**

@@ -11,6 +11,12 @@ import { runGeminiFallback } from './gemini-fallback.js';
 import { runOpenRouterFallback } from './openrouter-fallback.js';
 import { runPhi3Fallback } from './phi3-fallback.js';
 
+const CLAUDE_IDLE_TIMEOUT_MS = Number(process.env.CLAUDE_IDLE_TIMEOUT_MS || 180000);
+const CLAUDE_HARD_TIMEOUT_MS = Number(process.env.CLAUDE_HARD_TIMEOUT_MS || 600000);
+const CLAUDE_HEARTBEAT_INTERVAL_MS = Number(
+  process.env.CLAUDE_HEARTBEAT_INTERVAL_MS || 30000,
+);
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -18,7 +24,8 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  model?: 'claude' | 'gemini' | 'openrouter' | 'phi3';
+  model?: 'claude' | 'gemini' | 'openrouter' | 'local';
+  runId?: string;
 }
 
 interface ContainerOutput {
@@ -26,6 +33,8 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  modelUsed?: string;
+  provider?: string;
 }
 
 interface SessionEntry {
@@ -60,6 +69,51 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function buildFallbackHandoffPrompt(
+  originalPrompt: string,
+  failedProvider: string,
+  nextProvider: string,
+  errorMessage: string,
+): string {
+  const candidateStateFiles = [
+    '/workspace/group/ai/PROJECT_STATE.md',
+    '/workspace/group/ai/TASK_QUEUE.md',
+    '/workspace/group/ai/STATUS.md',
+    '/workspace/group/llm-context.json',
+  ];
+  const existingStateFiles = candidateStateFiles.filter((file) => fs.existsSync(file));
+  const stateFilesLine = existingStateFiles.length > 0
+    ? `Read these state files first: ${existingStateFiles.join(', ')}\n`
+    : '';
+
+  return (
+    `[FALLBACK_HANDOFF]\n` +
+    `Previous provider failed: ${failedProvider}\n` +
+    `Next provider: ${nextProvider}\n` +
+    `Failure reason: ${errorMessage}\n` +
+    `Workspace may already contain partial progress.\n` +
+    `Before continuing, inspect current workspace state and continue from latest real file state.\n` +
+    stateFilesLine +
+    `Prioritize: git status, git diff, and relevant project files.\n\n` +
+    `${originalPrompt}`
+  );
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -193,7 +247,7 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   lines.push('');
 
   for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : 'Andy';
+    const sender = msg.role === 'user' ? 'User' : 'Put';
     const content = msg.content.length > 2000
       ? msg.content.slice(0, 2000) + '...'
       : msg.content;
@@ -213,13 +267,15 @@ async function runClaudeAgent(input: ContainerInput, prompt: string): Promise<Co
   const ipcMcp = createIpcMcp({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
-    isMain: input.isMain
+    isMain: input.isMain,
+    sourceTag: 'claude',
   });
 
   let result: string | null = null;
   let newSessionId: string | undefined;
-
-  for await (const message of query({
+  let lastEventAt = Date.now();
+  let lastEventType = 'none';
+  const stream = query({
     prompt,
     options: {
       cwd: '/workspace/group',
@@ -244,14 +300,61 @@ async function runClaudeAgent(input: ContainerInput, prompt: string): Promise<Co
         PreCompact: [{ hooks: [createPreCompactHook()] }]
       }
     }
-  })) {
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
+  });
+
+  const iterator = stream[Symbol.asyncIterator]();
+  const startedAt = Date.now();
+
+  while (true) {
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > CLAUDE_HARD_TIMEOUT_MS) {
+      throw new Error(`claude hard timeout after ${CLAUDE_HARD_TIMEOUT_MS}ms`);
     }
 
-    if ('result' in message && message.result) {
-      result = message.result as string;
+    const remainingHardMs = CLAUDE_HARD_TIMEOUT_MS - elapsed;
+    const waitMs = Math.max(1, Math.min(CLAUDE_IDLE_TIMEOUT_MS, remainingHardMs));
+    let heartbeatTimer: NodeJS.Timeout | undefined;
+    try {
+      if (waitMs >= CLAUDE_HEARTBEAT_INTERVAL_MS) {
+        heartbeatTimer = setInterval(() => {
+          const now = Date.now();
+          log(
+            `Claude heartbeat: elapsed=${now - startedAt}ms, idleFor=${now - lastEventAt}ms, ` +
+              `lastEvent=${lastEventType}, session=${newSessionId || input.sessionId || 'new'}`,
+          );
+        }, CLAUDE_HEARTBEAT_INTERVAL_MS);
+      }
+
+      const { value: message, done } = await withTimeout(
+        iterator.next(),
+        waitMs,
+        'claude idle timeout',
+      );
+      if (done) break;
+
+      lastEventAt = Date.now();
+      lastEventType = `${message.type}${'subtype' in message && message.subtype ? `:${message.subtype}` : ''}`;
+
+      if (message.type === 'system' && message.subtype === 'init') {
+        newSessionId = message.session_id;
+        log(`Session initialized: ${newSessionId}`);
+      }
+
+      if ('result' in message && message.result) {
+        result = message.result as string;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('claude idle timeout')) {
+        const now = Date.now();
+        log(
+          `Claude idle timeout diagnostics: elapsed=${now - startedAt}ms, idleFor=${now - lastEventAt}ms, ` +
+            `lastEvent=${lastEventType}, session=${newSessionId || input.sessionId || 'new'}`,
+        );
+      }
+      throw err;
+    } finally {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
     }
   }
 
@@ -287,21 +390,23 @@ async function main(): Promise<void> {
       prompt,
       chatJid: input.chatJid,
       groupFolder: input.groupFolder,
-      isMain: input.isMain
+      isMain: input.isMain,
+      runId: input.runId,
     });
     writeOutput(output);
     if (output.status === 'error') process.exit(1);
     return;
   }
 
-  // Direct Phi3 routing
-  if (input.model === 'phi3') {
-    log('Routed directly to Phi3 fallback');
+  // Direct local fallback routing
+  if (input.model === 'local') {
+    log('Routed directly to local fallback');
     const output = await runPhi3Fallback({
       prompt,
       chatJid: input.chatJid,
       groupFolder: input.groupFolder,
-      isMain: input.isMain
+      isMain: input.isMain,
+      runId: input.runId,
     });
     writeOutput(output);
     if (output.status === 'error') process.exit(1);
@@ -315,28 +420,62 @@ async function main(): Promise<void> {
       prompt,
       chatJid: input.chatJid,
       groupFolder: input.groupFolder,
-      isMain: input.isMain
+      isMain: input.isMain,
+      runId: input.runId,
     });
-
-    if (output.status === 'success') {
-      writeOutput(output);
-      return;
-    }
-
-    // OpenRouter failed — try Gemini as backup
-    log('OpenRouter failed, trying Gemini as backup...');
-    const geminiOutput = await runGeminiFallback({
-      prompt,
-      chatJid: input.chatJid,
-      groupFolder: input.groupFolder,
-      isMain: input.isMain
-    });
-    writeOutput(geminiOutput);
-    if (geminiOutput.status === 'error') process.exit(1);
+    writeOutput(output);
+    if (output.status === 'error') process.exit(1);
     return;
   }
 
-  // Default: try Claude first, fallback to Gemini on ANY error
+  // Direct Claude routing:
+  // IMPORTANT: do NOT cascade to other providers here.
+  // Host-level router handles provider sequencing so each provider attempt gets a fresh container timeout.
+  if (input.model === 'claude') {
+    try {
+      log('Routed directly to Claude');
+      const output = await runClaudeAgent(input, prompt);
+      log('Claude agent completed successfully');
+      writeOutput({
+        status: output.status,
+        result: output.result,
+        newSessionId: output.newSessionId,
+      });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log(`Claude agent error: ${errorMessage}`);
+      const quotaError = isQuotaError(errorMessage);
+      const errorTag = quotaError ? 'claude_quota_exhausted' : 'claude_error';
+
+      // Write IPC notification for quota alerts
+      if (quotaError) {
+        const ipcNotifyDir = path.join('/workspace/ipc', 'messages');
+        fs.mkdirSync(ipcNotifyDir, { recursive: true });
+        const notifyFile = path.join(ipcNotifyDir, `${Date.now()}-quota-alert.json`);
+        fs.writeFileSync(
+          notifyFile,
+          JSON.stringify({
+            type: 'message',
+            chatJid: input.chatJid,
+            text: '[QUOTA ALERT] Claude is resting. Host will route next provider on retry.',
+            groupFolder: input.groupFolder,
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      }
+
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: `${errorTag}|${errorMessage}`,
+      });
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Default when model is unspecified: run Claude only.
+  // Host-level router should perform provider fallback sequencing.
   try {
     log('Starting Claude agent...');
     const output = await runClaudeAgent(input, prompt);
@@ -372,76 +511,12 @@ async function main(): Promise<void> {
         timestamp: new Date().toISOString()
       }));
     }
-
-    try {
-      const geminiOutput = await runGeminiFallback({
-        prompt,
-        chatJid: input.chatJid,
-        groupFolder: input.groupFolder,
-        isMain: input.isMain
-      });
-
-      if (geminiOutput.status === 'success') {
-        writeOutput({ ...geminiOutput, error: errorTag });
-      } else if (geminiOutput.error?.includes('gemini_rate_limit')) {
-        // Gemini also rate limited — try OpenRouter as last resort
-        log('Gemini rate limited, trying OpenRouter as last resort...');
-        try {
-          const openRouterOutput = await runOpenRouterFallback({
-            prompt,
-            chatJid: input.chatJid,
-            groupFolder: input.groupFolder,
-            isMain: input.isMain
-          });
-
-          if (openRouterOutput.status === 'success') {
-            writeOutput({ ...openRouterOutput, error: `${errorTag}|gemini_rate_limit|openrouter_used` });
-          } else {
-            writeOutput({ ...geminiOutput, error: `${errorTag}|${geminiOutput.error}|openrouter_failed` });
-            process.exit(1);
-          }
-        } catch (orErr) {
-          log(`OpenRouter fallback error: ${orErr instanceof Error ? orErr.message : String(orErr)}`);
-          writeOutput({ ...geminiOutput, error: `${errorTag}|${geminiOutput.error}` });
-          process.exit(1);
-        }
-      } else {
-        writeOutput({ ...geminiOutput, error: `${errorTag}|${geminiOutput.error}` });
-        process.exit(1);
-      }
-    } catch (geminiErr) {
-      const geminiErrMsg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
-      log(`Gemini fallback also failed: ${geminiErrMsg}`);
-
-      // Last resort: try OpenRouter (free models)
-      const isGeminiRateLimit = geminiErrMsg.includes('429') || geminiErrMsg.toLowerCase().includes('rate');
-      if (isGeminiRateLimit) {
-        log('Gemini rate limited, trying OpenRouter as last resort...');
-        try {
-          const openRouterOutput = await runOpenRouterFallback({
-            prompt,
-            chatJid: input.chatJid,
-            groupFolder: input.groupFolder,
-            isMain: input.isMain
-          });
-
-          if (openRouterOutput.status === 'success') {
-            writeOutput({ ...openRouterOutput, error: `${errorTag}|gemini_failed|openrouter_used` });
-            return;
-          }
-          log(`OpenRouter also failed: ${openRouterOutput.error}`);
-        } catch (orErr) {
-          log(`OpenRouter fallback error: ${orErr instanceof Error ? orErr.message : String(orErr)}`);
-        }
-      }
-
-      writeOutput({
-        status: 'error',
-        result: null,
-        error: `${errorTag}|gemini_also_failed`
-      });
-      process.exit(1);
-    }
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: `${errorTag}|${errorMessage}`,
+    });
+    process.exit(1);
   }
 }
 
